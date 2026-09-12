@@ -279,7 +279,7 @@ def classify_native_layout(top, bottom, low_visual=False):
     """根据字幕带位置和视觉价值选择原生字幕主图布局。"""
     if low_visual:
         return "low-visual-fallback"
-    return "bottom-band" if (top + bottom) / 2 >= 0.68 else "centered-band"
+    return "bottom-band" if (top + bottom) / 2 >= 0.74 else "centered-band"
 
 
 def visual_assessment(frame):
@@ -290,6 +290,7 @@ def visual_assessment(frame):
     edges = gray.filter(ImageFilter.FIND_EDGES)
     histogram = gray.histogram()
     dark_ratio = sum(histogram[:32]) / sum(histogram)
+    luminance_mean = gray_stat.mean[0]
     entropy = gray.entropy()
     luminance_std = gray_stat.stddev[0]
     edge_mean = ImageStat.Stat(edges).mean[0]
@@ -324,6 +325,15 @@ def visual_assessment(frame):
         reasons.append("low_luminance_variation")
     if score < 0.34:
         reasons.append("low_visual_score")
+    document_like = (
+        luminance_mean >= 155
+        and saturation_mean < 55
+        and edge_mean >= 20
+        and dark_ratio < 0.08
+        and subject_center_x is None
+    )
+    if document_like:
+        reasons.append("document_or_slide_low_visual")
     passed = not reasons
     signature = sample.resize((48, 27), Image.Resampling.BILINEAR)
     return {
@@ -331,6 +341,7 @@ def visual_assessment(frame):
         "score": round(score, 4),
         "entropy": round(entropy, 4),
         "luminance_std": round(luminance_std, 4),
+        "luminance_mean": round(luminance_mean, 4),
         "edge_mean": round(edge_mean, 4),
         "saturation_mean": round(saturation_mean, 4),
         "skin_tone_ratio": round(skin_tone_ratio, 4),
@@ -338,6 +349,7 @@ def visual_assessment(frame):
             round(subject_center_x, 4) if subject_center_x is not None else None
         ),
         "dark_ratio": round(dark_ratio, 4),
+        "document_like": document_like,
         "reasons": reasons,
         "signature": signature,
     }
@@ -706,27 +718,33 @@ def choose_visual_hero(
 
 
 def detect_native_quote_crop(band):
-    """用亮色笔画密度找原生字幕像素，不做 OCR 或重绘。"""
+    """根据底色自适应查找亮色或暗色原生字幕像素。"""
     gray = band.convert("L")
-    bright = 180
+    luminance_mean = ImageStat.Stat(gray).mean[0]
+    polarity = "dark_on_light" if luminance_mean >= 155 else "bright_on_dark"
+
+    def is_text_pixel(value):
+        return value <= 92 if polarity == "dark_on_light" else value >= 180
+
     row_floor = max(12, round(gray.width * 0.015))
     row_counts = [
-        sum(gray.getpixel((x, y)) >= bright for x in range(gray.width))
+        sum(is_text_pixel(gray.getpixel((x, y))) for x in range(gray.width))
         for y in range(gray.height)
     ]
     rows = [index for index, count in enumerate(row_counts) if count >= row_floor]
     if not rows:
         return band.copy(), {
             "detected": False,
-            "reason": "no_dense_bright_text_rows",
+            "reason": "no_dense_text_rows",
             "crop": [0, 0, band.width, band.height],
+            "polarity": polarity,
         }
     y0 = max(0, min(rows) - max(6, round(band.height * 0.06)))
     y1 = min(band.height, max(rows) + 1 + max(6, round(band.height * 0.06)))
     columns = []
     for x in range(gray.width):
         count = sum(
-            gray.getpixel((x, y)) >= bright for y in range(y0, y1)
+            is_text_pixel(gray.getpixel((x, y))) for y in range(y0, y1)
         )
         if count >= 5:
             columns.append(x)
@@ -735,6 +753,7 @@ def detect_native_quote_crop(band):
             "detected": False,
             "reason": "text_rows_found_but_columns_ambiguous",
             "crop": [0, y0, band.width, y1],
+            "polarity": polarity,
         }
     pad_x = max(12, round(band.width * 0.03))
     x0 = max(0, min(columns) - pad_x)
@@ -744,6 +763,7 @@ def detect_native_quote_crop(band):
         "reason": "dense_native_subtitle_pixels",
         "crop": [x0, y0, x1, y1],
         "source_retention": round((x1 - x0) / band.width, 4),
+        "polarity": polarity,
     }
 
 
@@ -773,6 +793,7 @@ def render_one(
     first = grab_frame(video, times[0])
     band, _, subtitle_bottom = crop_band(first, top, bottom)
     quote_detection = None
+    contained_frame_box = None
     if native_layout == "quote-first":
         background = ImageOps.fit(
             first,
@@ -804,6 +825,37 @@ def render_one(
             ((out_width - panel.width) // 2, (hero_height - panel.height) // 2),
         )
         band_height = quote.height
+        subtitle_horizontal_retention = 1.0
+        horizontal = 0.5
+    elif native_layout == "centered-band":
+        # 居中烧录字幕已经进入主画面；竖版裁宽会直接截断文字。
+        background_source = hero_frame or first
+        background = ImageOps.fit(
+            background_source,
+            (out_width, hero_height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        ).filter(ImageFilter.GaussianBlur(radius=max(8, out_width // 70)))
+        hero = Image.blend(
+            background,
+            Image.new("RGB", background.size, "#05070d"),
+            0.58,
+        )
+        contained = ImageOps.contain(
+            first,
+            (out_width, hero_height),
+            method=Image.Resampling.LANCZOS,
+        )
+        contained_x = (out_width - contained.width) // 2
+        contained_y = (hero_height - contained.height) // 2
+        hero.paste(contained, (contained_x, contained_y))
+        contained_frame_box = [
+            contained_x,
+            contained_y,
+            contained_x + contained.width,
+            contained_y + contained.height,
+        ]
+        band_height = contained.height
         subtitle_horizontal_retention = 1.0
         horizontal = 0.5
     elif native_layout == "legacy":
@@ -853,10 +905,28 @@ def render_one(
         subtitle_horizontal_retention = 1.0
 
     strips = []
+    subtitle_strip_strategy = (
+        "contain-full-band"
+        if native_layout in {"centered-band", "quote-first"}
+        else "full-width-band"
+    )
     for seconds, height in zip(times[1:], strip_heights):
         frame = grab_frame(video, seconds)
         band, _, _ = crop_band(frame, top, bottom)
-        strips.append(fit_lower(band, (out_width, height), vertical=0.72))
+        if native_layout in {"centered-band", "quote-first"}:
+            contained = ImageOps.contain(
+                band,
+                (out_width, height),
+                method=Image.Resampling.LANCZOS,
+            )
+            strip = Image.new("RGB", (out_width, height), "black")
+            strip.paste(
+                contained,
+                ((out_width - contained.width) // 2, (height - contained.height) // 2),
+            )
+            strips.append(strip)
+        else:
+            strips.append(fit_lower(band, (out_width, height), vertical=0.72))
 
     canvas = Image.new("RGB", (out_width, out_height), "black")
     canvas.paste(hero, (0, 0))
@@ -881,6 +951,8 @@ def render_one(
             round(horizontal, 4) if native_layout != "legacy" else 0.5
         ),
         "quote_detection": quote_detection,
+        "contained_frame_box": contained_frame_box,
+        "subtitle_strip_strategy": subtitle_strip_strategy,
     }
 
 
@@ -1439,6 +1511,10 @@ def command_render(args):
                 "dimensions_ok": dimensions_ok,
                 "subtitle_horizontal_retention": render_report[
                     "subtitle_horizontal_retention"
+                ],
+                "subtitle_integrity": "PASS" if subtitle_ok else "FAIL",
+                "subtitle_strip_strategy": render_report[
+                    "subtitle_strip_strategy"
                 ],
                 "visual_centering_x": render_report["visual_centering_x"],
                 "hero_visual": public_assessment(selection["assessment"]),

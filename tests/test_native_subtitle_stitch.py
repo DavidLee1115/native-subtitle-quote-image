@@ -63,6 +63,7 @@ class HelperTests(unittest.TestCase):
     def test_native_layout_distinguishes_bottom_center_and_low_visual(self):
         self.assertEqual(MODULE.classify_native_layout(0.78, 0.96), "bottom-band")
         self.assertEqual(MODULE.classify_native_layout(0.38, 0.62), "centered-band")
+        self.assertEqual(MODULE.classify_native_layout(0.381, 0.99), "centered-band")
         self.assertEqual(
             MODULE.classify_native_layout(0.38, 0.62, low_visual=True),
             "low-visual-fallback",
@@ -75,6 +76,55 @@ class HelperTests(unittest.TestCase):
         )
         self.assertFalse(MODULE.visual_assessment(empty)["passed"])
         self.assertTrue(MODULE.visual_assessment(rich)["passed"])
+
+    def test_visual_gate_rejects_light_document_or_slide(self):
+        slide = Image.new("RGB", (640, 360), "#eadfcb")
+        for y0 in (45, 170):
+            for y in range(y0, y0 + 45):
+                for x in range(70, 570):
+                    if (x // 7 + y // 5) % 3 == 0:
+                        slide.putpixel((x, y), (20, 20, 20))
+        assessment = MODULE.visual_assessment(slide)
+        self.assertFalse(assessment["passed"])
+        self.assertTrue(assessment["document_like"])
+        self.assertIn("document_or_slide_low_visual", assessment["reasons"])
+
+    def test_quote_first_false_positive_keeps_rich_original_hero(self):
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+        with mock.patch.object(MODULE, "grab_frame", return_value=rich):
+            result = MODULE.choose_visual_hero(
+                "unused.mp4",
+                10,
+                [],
+                30,
+                [],
+                [],
+                lambda _event, **_details: None,
+                quote_times=[10, 11, 12, 13, 14],
+            )
+        self.assertEqual(result["phase"], "original")
+        self.assertEqual(result["semantic_alignment"], "PASS")
+
+    def test_auto_repair_exhaustion_is_explicit_and_does_not_cross_source(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        events = []
+        with mock.patch.object(MODULE, "grab_frame", return_value=empty):
+            result = MODULE.choose_visual_hero(
+                "unused.mp4",
+                10,
+                [],
+                200,
+                [],
+                [180],
+                lambda event, **details: events.append((event, details)),
+                quote_times=[10, 11, 12, 13, 14],
+            )
+        self.assertIsNone(result)
+        exhausted = [details for event, details in events if event == "semantic_window_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["semantic_alignment"], "FAIL")
 
     def test_visual_gate_repairs_with_same_line_nearby_frame(self):
         empty = Image.new("RGB", (640, 360), "#050509")
@@ -289,9 +339,52 @@ class HelperTests(unittest.TestCase):
             )
             self.assertEqual(report["subtitle_horizontal_retention"], 1.0)
             with Image.open(out) as rendered:
+                x0, y0, x1, y1 = report["contained_frame_box"]
+                band_y = round(y0 + (y1 - y0) * 0.50)
+                self.assertGreater(rendered.getpixel((2, band_y))[0], 150)
+                self.assertGreater(rendered.getpixel((297, band_y))[1], 130)
+
+    def test_bottom_layout_preserves_full_subtitle_band_width(self):
+        semantic = Image.new("RGB", (640, 360), "#202020")
+        for y in range(round(360 * 0.78), round(360 * 0.96)):
+            for x in range(24):
+                semantic.putpixel((x, y), (240, 20, 20))
+                semantic.putpixel((639 - x, y), (20, 220, 20))
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            MODULE, "grab_frame", return_value=semantic
+        ):
+            out = Path(tmp) / "bottom.jpg"
+            report = MODULE.render_one(
+                "unused.mp4",
+                [0, 1, 2, 3, 4],
+                out,
+                (3, 4),
+                300,
+                0.78,
+                0.96,
+                None,
+                hero_frame=rich,
+                native_layout="bottom-band",
+            )
+            self.assertEqual(report["subtitle_horizontal_retention"], 1.0)
+            with Image.open(out) as rendered:
                 band_y = report["hero_height"] - report["band_height"] // 2
                 self.assertGreater(rendered.getpixel((2, band_y))[0], 150)
                 self.assertGreater(rendered.getpixel((297, band_y))[1], 130)
+
+    def test_quote_crop_supports_dark_text_on_light_background(self):
+        band = Image.new("RGB", (640, 180), "#eadfcb")
+        for y in range(60, 100):
+            for x in range(120, 520):
+                if (x // 7 + y // 5) % 3 == 0:
+                    band.putpixel((x, y), (20, 20, 20))
+        crop, report = MODULE.detect_native_quote_crop(band)
+        self.assertTrue(report["detected"])
+        self.assertEqual(report["polarity"], "dark_on_light")
+        self.assertLess(crop.width, band.width)
 
     def test_low_visual_fallback_excludes_candidate_lower_overlay(self):
         semantic = Image.new("RGB", (640, 360), "#202020")
