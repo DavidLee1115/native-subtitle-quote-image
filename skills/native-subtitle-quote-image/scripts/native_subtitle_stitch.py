@@ -403,8 +403,54 @@ def visual_distance(left, right):
     return sum(mean) / (len(mean) * 255.0)
 
 
-def candidate_groups(original, explicit, duration):
+def bounded_window(value, fallback, duration, label):
+    """校验 manifest 里的语义时间窗口。"""
+    raw = fallback if value is None else value
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise SystemExit(f"{label}必须是 [start, end]")
+    start = validate_time(raw[0], f"{label}[0]")
+    end = validate_time(raw[1], f"{label}[1]")
+    if end <= start:
+        raise SystemExit(f"{label}必须满足 start < end")
     latest = max(0.0, duration - min(0.5, duration / 10))
+    if start > latest or end > duration:
+        raise SystemExit(f"{label}必须位于视频时长内")
+    return [round(start, 3), round(min(end, latest), 3)]
+
+
+def semantic_windows(times, duration, theme_window=None, speaking_window=None):
+    """构造可机器证明的时间范围；显式 manifest 窗口优先。"""
+    quote_start, quote_end = min(times), max(times)
+    theme = bounded_window(
+        theme_window,
+        [max(0.0, quote_start - 30.0), min(duration, quote_end + 30.0)],
+        duration,
+        "theme_window",
+    )
+    speaking = bounded_window(
+        speaking_window,
+        [max(0.0, quote_start - 90.0), min(duration, quote_end + 90.0)],
+        duration,
+        "speaking_window",
+    )
+    if speaking[0] > theme[0] or speaking[1] < theme[1]:
+        raise SystemExit("speaking_window 必须完整包含 theme_window")
+    return {"theme": theme, "speaking": speaking}
+
+
+def candidate_groups(
+    original,
+    explicit,
+    duration,
+    quote_times=None,
+    theme_window=None,
+    speaking_window=None,
+):
+    latest = max(0.0, duration - min(0.5, duration / 10))
+    quote_times = quote_times or [original]
+    windows = semantic_windows(
+        quote_times, duration, theme_window=theme_window, speaking_window=speaking_window
+    )
 
     def valid(values):
         seen = set()
@@ -416,6 +462,41 @@ def candidate_groups(original, explicit, duration):
                 result.append(value)
         return result
 
+    theme_values = valid(
+        [
+            *explicit,
+            *quote_times[1:],
+            original - 4,
+            original + 4,
+            original - 10,
+            original + 10,
+            original - 20,
+            original + 20,
+            windows["theme"][0],
+            windows["theme"][1],
+        ]
+    )
+    theme_values = [
+        value
+        for value in theme_values
+        if windows["theme"][0] <= value <= windows["theme"][1]
+    ]
+    speaking_values = valid(
+        [
+            windows["speaking"][0] + offset
+            for offset in range(
+                0,
+                max(1, int(windows["speaking"][1] - windows["speaking"][0]) + 1),
+                15,
+            )
+        ]
+        + [windows["speaking"][1]]
+    )
+    speaking_values = [
+        value
+        for value in speaking_values
+        if not windows["theme"][0] <= value <= windows["theme"][1]
+    ]
     return [
         ("original", valid([original])),
         (
@@ -423,21 +504,10 @@ def candidate_groups(original, explicit, duration):
             valid([original - 0.8, original + 0.8, original - 1.5, original + 1.5]),
         ),
         (
-            "same-theme-candidate",
-            valid(
-                [
-                    *explicit,
-                    original - 4,
-                    original + 4,
-                    original - 10,
-                    original + 10,
-                    original - 20,
-                    original + 20,
-                    original - 30,
-                    original + 30,
-                ]
-            ),
+            "same-theme-window",
+            theme_values,
         ),
+        ("same-speaking-shot", speaking_values),
     ]
 
 
@@ -462,11 +532,63 @@ def choose_visual_hero(
     emit,
     global_cache=None,
     minimum_distance=0.035,
+    quote_times=None,
+    theme_window=None,
+    speaking_window=None,
+    allow_source_wide=False,
+    speaking_window_verified=False,
 ):
-    """按原帧、同句、同主题、全片候选顺序执行 visual gate 与修复。"""
-    groups = candidate_groups(original, explicit, duration)
-    groups.append(("source-wide-fallback", global_times))
+    """先约束语义时窗，再在窗口内执行 visual gate 与修复。"""
+    quote_times = quote_times or [original]
+    windows = semantic_windows(
+        quote_times, duration, theme_window=theme_window, speaking_window=speaking_window
+    )
+    groups = candidate_groups(
+        original,
+        explicit,
+        duration,
+        quote_times=quote_times,
+        theme_window=windows["theme"],
+        speaking_window=windows["speaking"],
+    )
+    if not speaking_window_verified:
+        groups = [group for group in groups if group[0] != "same-speaking-shot"]
+        emit(
+            "semantic_gate",
+            phase="same-speaking-shot",
+            accepted=False,
+            reason="unverified_speaking_window_not_declared",
+            semantic_window=windows["speaking"],
+            semantic_alignment="FAIL",
+        )
+    if allow_source_wide:
+        groups.append(("source-wide-fallback", global_times))
     attempted = set()
+
+    def semantic_basis_for(phase):
+        return (
+            "explicit_source_wide_compatibility_fallback"
+            if phase == "source-wide-fallback"
+            else "exact_quote_timestamp"
+            if phase == "original"
+            else "same_line_nearby_window"
+            if phase == "same-line-nearby"
+            else "bounded_theme_window"
+            if phase == "same-theme-window"
+            else "manifest_declared_speaking_window"
+        )
+
+    for seconds in explicit:
+        if not windows["theme"][0] <= seconds <= windows["theme"][1]:
+            emit(
+                "semantic_gate",
+                phase="same-theme-window",
+                time=seconds,
+                accepted=False,
+                reason="outside_theme_window",
+                semantic_window=windows["theme"],
+                semantic_alignment="FAIL",
+            )
 
     def evaluate(phase, seconds):
         if seconds in attempted:
@@ -490,6 +612,21 @@ def choose_visual_hero(
         reasons = list(assessment["reasons"])
         if assessment["passed"] and not diverse:
             reasons.append("near_duplicate_final")
+        semantic_basis = semantic_basis_for(phase)
+        semantic_window = (
+            None
+            if phase == "source-wide-fallback"
+            else [round(original, 3), round(original, 3)]
+            if phase == "original"
+            else [
+                round(max(0.0, original - 1.5), 3),
+                round(min(duration, original + 1.5), 3),
+            ]
+            if phase == "same-line-nearby"
+            else windows["theme"]
+            if phase == "same-theme-window"
+            else windows["speaking"]
+        )
         emit(
             "visual_gate",
             phase=phase,
@@ -498,6 +635,11 @@ def choose_visual_hero(
             nearest_final_distance=round(nearest, 4),
             reasons=reasons,
             metrics=public_assessment(assessment),
+            semantic_window=semantic_window,
+            semantic_alignment=(
+                "PARTIAL_PASS" if phase == "source-wide-fallback" else "PASS"
+            ),
+            semantic_basis=semantic_basis,
         )
         if not accepted:
             return None
@@ -546,8 +688,63 @@ def choose_visual_hero(
                 "frame": frame,
                 "assessment": assessment,
                 "phase": phase,
+                "semantic_alignment": (
+                    "PARTIAL_PASS" if phase == "source-wide-fallback" else "PASS"
+                ),
+                "semantic_basis": semantic_basis_for(phase),
             }
+    emit(
+        "semantic_window_exhausted",
+        phase="semantic-window",
+        accepted=False,
+        reason="no_visual_candidate_passed_within_semantic_windows",
+        theme_window=windows["theme"],
+        speaking_window=windows["speaking"],
+        semantic_alignment="FAIL",
+    )
     return None
+
+
+def detect_native_quote_crop(band):
+    """用亮色笔画密度找原生字幕像素，不做 OCR 或重绘。"""
+    gray = band.convert("L")
+    bright = 180
+    row_floor = max(12, round(gray.width * 0.015))
+    row_counts = [
+        sum(gray.getpixel((x, y)) >= bright for x in range(gray.width))
+        for y in range(gray.height)
+    ]
+    rows = [index for index, count in enumerate(row_counts) if count >= row_floor]
+    if not rows:
+        return band.copy(), {
+            "detected": False,
+            "reason": "no_dense_bright_text_rows",
+            "crop": [0, 0, band.width, band.height],
+        }
+    y0 = max(0, min(rows) - max(6, round(band.height * 0.06)))
+    y1 = min(band.height, max(rows) + 1 + max(6, round(band.height * 0.06)))
+    columns = []
+    for x in range(gray.width):
+        count = sum(
+            gray.getpixel((x, y)) >= bright for y in range(y0, y1)
+        )
+        if count >= 5:
+            columns.append(x)
+    if not columns:
+        return band.crop((0, y0, band.width, y1)), {
+            "detected": False,
+            "reason": "text_rows_found_but_columns_ambiguous",
+            "crop": [0, y0, band.width, y1],
+        }
+    pad_x = max(12, round(band.width * 0.03))
+    x0 = max(0, min(columns) - pad_x)
+    x1 = min(band.width, max(columns) + 1 + pad_x)
+    return band.crop((x0, y0, x1, y1)), {
+        "detected": True,
+        "reason": "dense_native_subtitle_pixels",
+        "crop": [x0, y0, x1, y1],
+        "source_retention": round((x1 - x0) / band.width, 4),
+    }
 
 
 def render_one(
@@ -575,7 +772,41 @@ def render_one(
 
     first = grab_frame(video, times[0])
     band, _, subtitle_bottom = crop_band(first, top, bottom)
-    if native_layout == "legacy":
+    quote_detection = None
+    if native_layout == "quote-first":
+        background = ImageOps.fit(
+            first,
+            (out_width, hero_height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        ).filter(ImageFilter.GaussianBlur(radius=max(8, out_width // 70)))
+        hero = Image.blend(
+            background,
+            Image.new("RGB", background.size, "#05070d"),
+            0.68,
+        )
+        quote_crop, quote_detection = detect_native_quote_crop(band)
+        quote = ImageOps.contain(
+            quote_crop,
+            (round(out_width * 0.90), round(hero_height * 0.58)),
+            method=Image.Resampling.LANCZOS,
+        )
+        padding_x = max(24, round(out_width * 0.035))
+        padding_y = max(20, round(out_width * 0.025))
+        panel = Image.new(
+            "RGB",
+            (min(out_width, quote.width + padding_x * 2), quote.height + padding_y * 2),
+            "#090d16",
+        )
+        panel.paste(quote, ((panel.width - quote.width) // 2, padding_y))
+        hero.paste(
+            panel,
+            ((out_width - panel.width) // 2, (hero_height - panel.height) // 2),
+        )
+        band_height = quote.height
+        subtitle_horizontal_retention = 1.0
+        horizontal = 0.5
+    elif native_layout == "legacy":
         wanted_hero_source_h = min(
             subtitle_bottom,
             max(1, round(first.width * hero_height / out_width)),
@@ -649,6 +880,7 @@ def render_one(
         "visual_centering_x": (
             round(horizontal, 4) if native_layout != "legacy" else 0.5
         ),
+        "quote_detection": quote_detection,
     }
 
 
@@ -934,12 +1166,25 @@ def command_render(args):
             raise SystemExit(
                 f"images[{index}].hero_candidates 必须全部小于视频时长 {duration:.2f}s"
             )
+        if "theme_window" in item and "semantic_window" in item:
+            raise SystemExit(
+                f"images[{index}] 不要同时传 theme_window 和 semantic_window"
+            )
+        windows = semantic_windows(
+            times,
+            duration,
+            theme_window=item.get("theme_window", item.get("semantic_window")),
+            speaking_window=item.get("speaking_window"),
+        )
         jobs.append(
             {
                 "index": index,
                 "title": title,
                 "times": times,
                 "hero_candidates": hero_candidates,
+                "theme_window": windows["theme"],
+                "speaking_window": windows["speaking"],
+                "speaking_window_verified": "speaking_window" in item,
             }
         )
 
@@ -961,7 +1206,11 @@ def command_render(args):
     qa_items = []
     accepted_outputs = []
     used_signatures = []
-    global_times = global_candidate_times(duration, args.global_candidates)
+    global_times = (
+        global_candidate_times(duration, args.global_candidates)
+        if args.allow_source_wide_fallback
+        else []
+    )
     global_cache = {}
 
     def emit(event, **details):
@@ -979,7 +1228,26 @@ def command_render(args):
         title = job["title"]
         times = job["times"]
         emit("item_start", index=index, title=title, time=times[0])
-        if args.visual_gate == "off":
+        if args.native_layout == "quote-first":
+            hero_frame = grab_frame(video, times[0])
+            assessment = visual_assessment(hero_frame)
+            selection = {
+                "time": times[0],
+                "frame": hero_frame,
+                "assessment": assessment,
+                "phase": "quote-first-forced",
+                "semantic_alignment": "PASS",
+                "semantic_basis": "exact_quote_timestamp_quote_first",
+            }
+            emit(
+                "quote_first_switch",
+                index=index,
+                layout="quote-first",
+                reason="explicit_native_layout",
+                original_time=times[0],
+                semantic_alignment="PASS",
+            )
+        elif args.visual_gate == "off":
             hero_frame = grab_frame(video, times[0])
             assessment = visual_assessment(hero_frame)
             selection = {
@@ -987,6 +1255,8 @@ def command_render(args):
                 "frame": hero_frame,
                 "assessment": assessment,
                 "phase": "visual-gate-off",
+                "semantic_alignment": "PASS",
+                "semantic_basis": "exact_quote_timestamp_visual_gate_off",
             }
             emit(
                 "visual_gate",
@@ -1007,28 +1277,60 @@ def command_render(args):
                 lambda event, **details: emit(event, index=index, **details),
                 global_cache=global_cache,
                 minimum_distance=args.minimum_visual_distance,
+                quote_times=times,
+                theme_window=job["theme_window"],
+                speaking_window=job["speaking_window"],
+                allow_source_wide=args.allow_source_wide_fallback,
+                speaking_window_verified=job["speaking_window_verified"],
             )
         if selection is None:
-            reason = "所有同句、同主题和全片候选均未通过 visual gate"
-            emit("qa", index=index, result="FAIL", reason=reason)
-            qa_items.append(
-                {
-                    "index": index,
-                    "title": title,
-                    "file": None,
-                    "result": "FAIL",
-                    "reason": reason,
-                    "original_time": times[0],
+            if args.native_layout in {"auto", "quote-first"}:
+                hero_frame = grab_frame(video, times[0])
+                assessment = visual_assessment(hero_frame)
+                selection = {
+                    "time": times[0],
+                    "frame": hero_frame,
+                    "assessment": assessment,
+                    "phase": "quote-first-fallback",
+                    "semantic_alignment": "PASS",
+                    "semantic_basis": "exact_quote_timestamp_quote_first",
                 }
-            )
-            continue
+                emit(
+                    "quote_first_switch",
+                    index=index,
+                    action="layout-degrade",
+                    layout="quote-first",
+                    reason="semantic_window_exhausted_low_visual_value",
+                    original_time=times[0],
+                    semantic_alignment="PASS",
+                )
+            else:
+                reason = "语义窗口内没有候选通过 visual gate，且已强制非 quote-first 布局"
+                emit("qa", index=index, result="FAIL", reason=reason)
+                qa_items.append(
+                    {
+                        "index": index,
+                        "title": title,
+                        "file": None,
+                        "result": "FAIL",
+                        "reason": reason,
+                        "original_time": times[0],
+                        "semantic_alignment": "FAIL",
+                        "semantic_alignment_reason": "no_eligible_semantic_hero",
+                    }
+                )
+                continue
 
         phase = selection["phase"]
         if args.native_layout == "auto":
-            layout = classify_native_layout(
-                args.band_top,
-                args.band_bottom,
-                low_visual=phase not in {"original", "visual-gate-off"},
+            layout = (
+                "quote-first"
+                if phase in {"quote-first-fallback", "quote-first-forced"}
+                else classify_native_layout(
+                    args.band_top,
+                    args.band_bottom,
+                    low_visual=phase not in {"original", "visual-gate-off"},
+                )
             )
         elif args.native_layout == "bottom":
             layout = "bottom-band"
@@ -1036,6 +1338,8 @@ def command_render(args):
             layout = "centered-band"
         elif args.native_layout == "preserve":
             layout = "preserve-band"
+        elif args.native_layout == "quote-first":
+            layout = "quote-first"
         else:
             layout = "legacy"
         emit(
@@ -1043,7 +1347,11 @@ def command_render(args):
             index=index,
             layout=layout,
             reason=(
-                "low_visual_candidate_replaced"
+                "semantic_window_exhausted_quote_first"
+                if phase == "quote-first-fallback"
+                else "explicit_quote_first"
+                if phase == "quote-first-forced"
+                else "low_visual_candidate_replaced"
                 if phase not in {"original", "visual-gate-off"}
                 else "subtitle_band_position"
             ),
@@ -1087,15 +1395,32 @@ def command_render(args):
             layout = "preserve-band"
             subtitle_ok = render_report["subtitle_horizontal_retention"] >= 0.98
 
-        visual_ok = selection["assessment"]["passed"] or args.visual_gate == "off"
-        passed = dimensions_ok and subtitle_ok and visual_ok
+        visual_ok = (
+            layout == "quote-first"
+            or selection["assessment"]["passed"]
+            or args.visual_gate == "off"
+        )
+        semantic_alignment = selection.get("semantic_alignment", "PASS")
+        passed = (
+            dimensions_ok
+            and subtitle_ok
+            and visual_ok
+            and semantic_alignment != "FAIL"
+        )
         if not passed:
             result = "FAIL"
-        elif phase == "source-wide-fallback":
+        elif semantic_alignment == "PARTIAL_PASS":
             result = "PARTIAL_PASS"
         else:
             result = "PASS"
-        emit("qa", index=index, result=result, layout=layout)
+        emit(
+            "qa",
+            index=index,
+            result=result,
+            layout=layout,
+            semantic_alignment=semantic_alignment,
+            semantic_basis=selection.get("semantic_basis"),
+        )
         qa_items.append(
             {
                 "index": index,
@@ -1106,22 +1431,37 @@ def command_render(args):
                 "hero_time": selection["time"],
                 "repair_phase": phase,
                 "layout": layout,
+                "semantic_alignment": semantic_alignment,
+                "semantic_alignment_reason": selection.get("semantic_basis"),
+                "theme_window": job["theme_window"],
+                "speaking_window": job["speaking_window"],
+                "speaking_window_verified": job["speaking_window_verified"],
                 "dimensions_ok": dimensions_ok,
                 "subtitle_horizontal_retention": render_report[
                     "subtitle_horizontal_retention"
                 ],
                 "visual_centering_x": render_report["visual_centering_x"],
                 "hero_visual": public_assessment(selection["assessment"]),
+                "visual_strategy": (
+                    "native_quote_pixels"
+                    if layout == "quote-first"
+                    else "selected_video_frame"
+                ),
+                "visual_strategy_ok": visual_ok,
+                "quote_detection": render_report["quote_detection"],
                 "note": (
                     "同源全片视觉 fallback；字幕仍来自原时间点，主题对应需人工确认"
                     if phase == "source-wide-fallback"
+                    else "语义窗口内均为低视觉价值画面；已改用原时间点的原生字幕像素作为主视觉"
+                    if phase == "quote-first-fallback"
                     else None
                 ),
             }
         )
         if passed:
             accepted_outputs.append(out_path)
-            used_signatures.append(selection["assessment"]["signature"])
+            if not phase.startswith("quote-first"):
+                used_signatures.append(selection["assessment"]["signature"])
 
     if manifest_path != manifest_target:
         shutil.copyfile(manifest_path, manifest_target)
@@ -1137,10 +1477,20 @@ def command_render(args):
     )
     qa_payload = {
         "overall": overall,
+        "semantic_alignment": (
+            "FAIL"
+            if any(item.get("semantic_alignment") == "FAIL" for item in qa_items)
+            else "PARTIAL_PASS"
+            if any(
+                item.get("semantic_alignment") == "PARTIAL_PASS" for item in qa_items
+            )
+            else "PASS"
+        ),
         "mode": "native",
         "expected_images": len(jobs),
         "accepted_images": len(accepted_outputs),
         "visual_gate": args.visual_gate,
+        "allow_source_wide_fallback": args.allow_source_wide_fallback,
         "items": qa_items,
     }
     qa_target.write_text(
@@ -1242,9 +1592,9 @@ def main():
     )
     render.add_argument(
         "--native-layout",
-        choices=("auto", "bottom", "centered", "preserve", "legacy"),
+        choices=("auto", "bottom", "centered", "preserve", "quote-first", "legacy"),
         default="auto",
-        help="原生字幕主图布局；auto 根据字幕位置与 visual gate 自适应",
+        help="原生字幕主图布局；auto 会在语义候选耗尽后改用 quote-first",
     )
     render.add_argument(
         "--visual-gate",
@@ -1256,7 +1606,12 @@ def main():
         "--global-candidates",
         type=int,
         default=32,
-        help="局部修复失败后扫描的全片候选数（默认 32）",
+        help="显式开启全片兼容 fallback 时的候选数（默认 32）",
+    )
+    render.add_argument(
+        "--allow-source-wide-fallback",
+        action="store_true",
+        help="兼容 Phase 1 的全片换主图；结果仅能是 PARTIAL_PASS",
     )
     render.add_argument(
         "--minimum-visual-distance",

@@ -126,10 +126,126 @@ class HelperTests(unittest.TestCase):
                 [],
                 [140, 150],
                 lambda _event, **_details: None,
+                allow_source_wide=True,
             )
         self.assertEqual(result["phase"], "source-wide-fallback")
         self.assertEqual(result["time"], 150)
         self.assertGreater(result["assessment"]["skin_tone_ratio"], 0.10)
+
+    def test_default_selection_does_not_cross_semantic_window(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+        seen = []
+
+        def fake_frame(_video, seconds):
+            seen.append(seconds)
+            return rich if seconds == 180 else empty
+
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake_frame):
+            result = MODULE.choose_visual_hero(
+                "unused.mp4",
+                10,
+                [],
+                200,
+                [],
+                [180],
+                lambda _event, **_details: None,
+                quote_times=[10, 11, 12, 13, 14],
+            )
+        self.assertIsNone(result)
+        self.assertNotIn(180, seen)
+
+    def test_semantic_groups_are_ordered_and_bounded(self):
+        groups = MODULE.candidate_groups(
+            100,
+            [40, 105, 180],
+            240,
+            quote_times=[100, 101, 102, 103, 104],
+        )
+        self.assertEqual(
+            [name for name, _values in groups],
+            ["original", "same-line-nearby", "same-theme-window", "same-speaking-shot"],
+        )
+        theme = dict(groups)["same-theme-window"]
+        self.assertIn(105, theme)
+        self.assertNotIn(40, theme)
+        self.assertNotIn(180, theme)
+        self.assertTrue(all(70 <= value <= 134 for value in theme))
+
+    def test_outside_explicit_candidate_is_rejected_by_semantic_gate(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        events = []
+        with mock.patch.object(MODULE, "grab_frame", return_value=empty):
+            MODULE.choose_visual_hero(
+                "unused.mp4",
+                100,
+                [180],
+                240,
+                [],
+                [],
+                lambda event, **details: events.append((event, details)),
+                quote_times=[100, 101, 102, 103, 104],
+            )
+        rejected = [
+            details
+            for event, details in events
+            if event == "semantic_gate" and details.get("reason") == "outside_theme_window"
+        ]
+        self.assertEqual(rejected[0]["time"], 180)
+        self.assertEqual(rejected[0]["reason"], "outside_theme_window")
+
+    def test_declared_speaking_window_enables_final_semantic_layer(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+
+        def fake_frame(_video, seconds):
+            return rich if seconds == 25 else empty
+
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake_frame):
+            result = MODULE.choose_visual_hero(
+                "unused.mp4",
+                100,
+                [],
+                240,
+                [],
+                [],
+                lambda _event, **_details: None,
+                quote_times=[100, 101, 102, 103, 104],
+                speaking_window=[10, 190],
+                speaking_window_verified=True,
+            )
+        self.assertEqual(result["phase"], "same-speaking-shot")
+        self.assertEqual(result["semantic_basis"], "manifest_declared_speaking_window")
+
+    def test_quote_first_uses_native_pixels_and_preserves_quote_width(self):
+        frame = Image.new("RGB", (640, 360), "#02040a")
+        for y in range(160, 195):
+            for x in range(90, 550):
+                if (x // 8 + y // 6) % 3 == 0:
+                    frame.putpixel((x, y), (245, 245, 245))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            MODULE, "grab_frame", return_value=frame
+        ):
+            out = Path(tmp) / "quote-first.jpg"
+            report = MODULE.render_one(
+                "unused.mp4",
+                [0, 1, 2, 3, 4],
+                out,
+                (3, 4),
+                300,
+                0.38,
+                0.62,
+                None,
+                native_layout="quote-first",
+            )
+            self.assertTrue(report["quote_detection"]["detected"])
+            self.assertEqual(report["subtitle_horizontal_retention"], 1.0)
+            with Image.open(out) as rendered:
+                self.assertEqual(rendered.size, (300, 400))
 
     def test_subject_center_ignores_edge_connected_background(self):
         width, height = 20, 10
@@ -469,6 +585,9 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertTrue((out_dir / "原生字幕时间点.json").is_file())
             self.assertTrue((out_dir / "qa-results.json").is_file())
             self.assertTrue((out_dir / "render-decisions.jsonl").is_file())
+            qa = json.loads((out_dir / "qa-results.json").read_text(encoding="utf-8"))
+            self.assertEqual(qa["semantic_alignment"], "PASS")
+            self.assertEqual(qa["items"][0]["semantic_alignment"], "PASS")
             with Image.open(output) as rendered:
                 self.assertEqual(rendered.size, (300, 400))
 

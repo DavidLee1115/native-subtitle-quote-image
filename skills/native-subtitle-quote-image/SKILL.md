@@ -129,7 +129,7 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render VIDEO \
 
 `title` 只用于文件名，不画进图片。`times` 必须来自已回看的稳定帧。输出包含逐张 JPG、`原生字幕时间点.json` 和 `final_contact_sheet.jpg`。
 
-增强版 `render` 会在 final 入选前自动运行 visual gate，并根据字幕带位置选择 `bottom-band` 或 `centered-band`。语义时间点画面价值过低时，按同句附近、同主题候选、全片稀疏候选的有界顺序自动换主图，但第一句字幕带仍取自原时间点的真实像素。可在 manifest 的单项中添加可选 `hero_candidates` 数组提供同主题主图候选。每次判断写入 `render-decisions.jsonl`，逐图结果写入 `qa-results.json`；全片 fallback 标为需要主题人工复核的 `PARTIAL_PASS`。
+增强版 `render` 会在 final 入选前自动运行 visual gate，并先约束 hero 的语义时间范围。优先级是原时间点、同句附近、同主题窗口，最后是 manifest 明确声明的同段 `speaking_window`。仅有时间接近不能自动证明 speaking shot；未声明时该层会被记录为语义拒绝。若窗口内始终是纯星空、空镜或 PPT，默认切换 `quote-first`，放大原时间点的原生字幕像素，不做 OCR 或重绘。可用 `hero_candidates`、`theme_window` 和 `speaking_window` 提供可审核的候选边界。每次判断写入 `render-decisions.jsonl`，逐图 `semantic_alignment` 写入 `qa-results.json`。只有显式 `--allow-source-wide-fallback` 才会启用 Phase 1 全片兼容路径，且最高标为 `PARTIAL_PASS`。
 
 ## 脚本字幕模式
 
