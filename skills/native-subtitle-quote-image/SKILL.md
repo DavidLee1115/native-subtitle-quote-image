@@ -127,9 +127,9 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render VIDEO \
   --band-top 0.78 --band-bottom 0.96
 ```
 
-`title` 只用于文件名，不画进图片。`times` 必须来自已回看的稳定帧。输出包含逐张 JPG、`原生字幕时间点.json` 和 `final_contact_sheet.jpg`。
+`title` 只用于文件名，不画进图片。`times` 必须来自已回看的稳定帧。有原始 cue 边界时，为每个 `times` 增加一一对应的 `cue_windows: [{"start": ..., "end": ...}]`，供最终字幕条时序证据和同 cue 有界修复使用。输出包含逐张 JPG、`原生字幕时间点.json`、`qa-results.json`、`render-decisions.jsonl` 和 `final_contact_sheet.jpg`。
 
-增强版 `render` 会在 final 入选前自动运行 visual gate，并先约束 hero 的语义时间范围。优先级是原时间点、同句附近、同主题窗口，最后是 manifest 明确声明的同段 `speaking_window`。仅有时间接近不能自动证明 speaking shot；未声明时该层会被记录为语义拒绝。若窗口内始终是纯星空、空镜或 PPT，默认切换 `quote-first`，放大原时间点的原生字幕像素，不做 OCR 或重绘。可用 `hero_candidates`、`theme_window` 和 `speaking_window` 提供可审核的候选边界。每次判断写入 `render-decisions.jsonl`，逐图 `semantic_alignment` 写入 `qa-results.json`。只有显式 `--allow-source-wide-fallback` 才会启用 Phase 1 全片兼容路径，且最高标为 `PARTIAL_PASS`。
+增强版 `render` 会在 final 入选前自动运行 visual gate，并先约束 hero 的语义时间范围。优先级是原时间点、同句附近、同主题窗口，最后是 manifest 明确声明的同段 `speaking_window`。仅有时间接近不能自动证明 speaking shot；未声明时该层会被记录为语义拒绝。若窗口内始终是纯星空、空镜或 PPT，默认切换 `quote-first`，放大原时间点的原生字幕像素，不做 OCR 或重绘。可用 `hero_candidates`、`theme_window` 和 `speaking_window` 提供可审核的候选边界。最终原生字幕 QA 会检查每一条 strip 的对比度、边缘、文字形组件和可用的时序差分证据；计划 N 条时必须 N 条都通过。漏字时先在同 cue 内修复 band 或时间点，不跨 cue 借字。每次判断写入 `render-decisions.jsonl`，逐图 `semantic_alignment`、`native_subtitle_presence` 和 `final_renderability` 写入 `qa-results.json`。只有显式 `--allow-source-wide-fallback` 才会启用 Phase 1 全片兼容路径，且最高标为 `PARTIAL_PASS`。
 
 ## 脚本字幕模式
 
@@ -161,6 +161,8 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render-script VIDEO \
 ```
 
 脚本会尝试 macOS、Windows 和 Linux 常见 CJK 字体。无法自动找到时，用 `--font /path/to/font.ttc` 指定已获授权的字体。需要调整字幕条在原帧中的垂直采样位置时，使用 `--band-center`；不要把它当作行距参数。
+
+`render-script` 会对实际 3:4 hero crop 运行最终可渲染性检查。常规 `fit` 裁切出现主体保留不足、文字越界、低有效内容或大片空白时，先自动修复为保留完整源帧的 `contain` 布局并重做 QA。结果写入 `<output>.qa-results.json` 和 `<output>.render-decisions.jsonl`，包含 `final_renderability`、`subject_retention`、`active_content_ratio`、`excessive_blank_area` 和 `crop_safety`。
 
 ## 逐张质检与有界返工
 

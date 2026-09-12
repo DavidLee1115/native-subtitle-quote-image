@@ -2,6 +2,7 @@
 """把视频精确取帧并拼成字幕长图，支持烧录字幕与台词脚本两种模式。"""
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -13,6 +14,12 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
+
+
+FINAL_QA_PATH = Path(__file__).with_name("final_render_qa.py")
+FINAL_QA_SPEC = importlib.util.spec_from_file_location("final_render_qa", FINAL_QA_PATH)
+FINAL_QA = importlib.util.module_from_spec(FINAL_QA_SPEC)
+FINAL_QA_SPEC.loader.exec_module(FINAL_QA)
 
 try:
     import imageio_ffmpeg
@@ -778,6 +785,7 @@ def render_one(
     hero_fraction,
     hero_frame=None,
     native_layout="legacy",
+    strip_bands=None,
 ):
     times = normalize_times(times)
     aw, ah = aspect
@@ -789,11 +797,26 @@ def render_one(
     base_strip = remaining // strip_count
     strip_heights = [base_strip] * strip_count
     strip_heights[-1] += remaining - sum(strip_heights)
+    if strip_bands is None:
+        strip_bands = [[top, bottom] for _ in range(strip_count)]
+    if len(strip_bands) != strip_count:
+        raise ValueError("strip_bands must align one-to-one with final strips")
+    normalized_strip_bands = []
+    for index, value in enumerate(strip_bands):
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"strip_bands[{index}] must be [top, bottom]")
+        strip_top, strip_bottom = (float(item) for item in value)
+        if not 0 <= strip_top < strip_bottom <= 1:
+            raise ValueError(f"strip_bands[{index}] must satisfy 0 <= top < bottom <= 1")
+        normalized_strip_bands.append([strip_top, strip_bottom])
 
     first = grab_frame(video, times[0])
     band, _, subtitle_bottom = crop_band(first, top, bottom)
     quote_detection = None
     contained_frame_box = None
+    hero_source_kind = "first_frame"
+    hero_content_box = [0, 0, out_width, hero_height]
+    hero_source_crop_box = [0.0, 0.0, float(first.width), float(first.height)]
     if native_layout == "quote-first":
         background = ImageOps.fit(
             first,
@@ -866,6 +889,15 @@ def render_one(
         hero_source = first.crop(
             (0, subtitle_bottom - wanted_hero_source_h, first.width, subtitle_bottom)
         )
+        fitted_crop = FINAL_QA.fit_crop_box(
+            hero_source.size, (out_width, hero_height), (0.5, 0.75)
+        )
+        hero_source_crop_box = [
+            fitted_crop[0],
+            fitted_crop[1] + subtitle_bottom - wanted_hero_source_h,
+            fitted_crop[2],
+            fitted_crop[3] + subtitle_bottom - wanted_hero_source_h,
+        ]
         hero = fit_lower(hero_source, (out_width, hero_height), vertical=0.75)
         visible_source_width = min(
             first.width, round(wanted_hero_source_h * out_width / hero_height)
@@ -874,7 +906,9 @@ def render_one(
         band_height = None
     else:
         visual_source = hero_frame or first
+        hero_source_kind = "selected_hero_frame" if hero_frame is not None else "first_frame"
         subject_center_x = None
+        visual_origin_y = 0
         if native_layout == "low-visual-fallback":
             subject_center_x = visual_assessment(visual_source)["subject_center_x"]
             visual_source = visual_source.crop(
@@ -896,6 +930,14 @@ def render_one(
             method=Image.Resampling.LANCZOS,
             centering=(horizontal, vertical),
         )
+        hero_source_crop_box = FINAL_QA.fit_crop_box(
+            visual_source.size,
+            (out_width, visual_height),
+            (horizontal, vertical),
+        )
+        hero_source_crop_box[1] += visual_origin_y
+        hero_source_crop_box[3] += visual_origin_y
+        hero_content_box = [0, 0, out_width, visual_height]
         preserved_band = band.resize(
             (out_width, band_height), Image.Resampling.LANCZOS
         )
@@ -910,9 +952,11 @@ def render_one(
         if native_layout in {"centered-band", "quote-first"}
         else "full-width-band"
     )
-    for seconds, height in zip(times[1:], strip_heights):
+    for seconds, height, strip_band in zip(
+        times[1:], strip_heights, normalized_strip_bands
+    ):
         frame = grab_frame(video, seconds)
-        band, _, _ = crop_band(frame, top, bottom)
+        band, _, _ = crop_band(frame, strip_band[0], strip_band[1])
         if native_layout in {"centered-band", "quote-first"}:
             contained = ImageOps.contain(
                 band,
@@ -953,6 +997,14 @@ def render_one(
         "quote_detection": quote_detection,
         "contained_frame_box": contained_frame_box,
         "subtitle_strip_strategy": subtitle_strip_strategy,
+        "strip_heights": strip_heights,
+        "strip_bands": [
+            [round(value[0], 4), round(value[1], 4)]
+            for value in normalized_strip_bands
+        ],
+        "hero_source_kind": hero_source_kind,
+        "hero_source_crop_box": [round(value, 4) for value in hero_source_crop_box],
+        "hero_content_box": hero_content_box,
     }
 
 
@@ -966,6 +1018,7 @@ def scripted_render_one(
     hero_fraction,
     font_path,
     font_size,
+    hero_layout="fit",
 ):
     aw, ah = aspect
     out_height = round(out_width * ah / aw)
@@ -979,12 +1032,40 @@ def scripted_render_one(
     base_font = font_size or max(24, round(out_width / 18))
 
     first_frame = grab_frame(video, lines[0]["t"])
-    hero = ImageOps.fit(
-        first_frame,
-        (out_width, hero_height),
-        method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.5),
-    )
+    if hero_layout == "contain":
+        background = ImageOps.fit(
+            first_frame,
+            (out_width, hero_height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        ).filter(ImageFilter.GaussianBlur(radius=max(8, out_width // 70)))
+        hero = Image.blend(
+            background,
+            Image.new("RGB", background.size, "#05070d"),
+            0.42,
+        )
+        contained = ImageOps.contain(
+            first_frame,
+            (out_width, hero_height),
+            method=Image.Resampling.LANCZOS,
+        )
+        hero.paste(
+            contained,
+            ((out_width - contained.width) // 2, (hero_height - contained.height) // 2),
+        )
+        source_crop_box = [0.0, 0.0, float(first_frame.width), float(first_frame.height)]
+    elif hero_layout == "fit":
+        hero = ImageOps.fit(
+            first_frame,
+            (out_width, hero_height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        source_crop_box = FINAL_QA.fit_crop_box(
+            first_frame.size, (out_width, hero_height)
+        )
+    else:
+        raise ValueError("hero_layout must be fit or contain")
     first_strip_height = strip_heights[0]
     draw_scripted_subtitle(
         hero,
@@ -1033,6 +1114,13 @@ def scripted_render_one(
         f"脚本模式: 主画面 {hero_fraction:.1%}，"
         f"字幕条 {strip_count} 个，条间距 0"
     )
+    return {
+        "layout": hero_layout,
+        "hero_height": hero_height,
+        "strip_heights": strip_heights,
+        "source_crop_box": source_crop_box,
+        "hero_box": [0, 0, out_width, hero_height],
+    }
 
 
 def contact_sheet(paths, out_path, columns=4):
@@ -1227,6 +1315,28 @@ def command_render(args):
                 f"images[{index}].times 的最后时间点 {times[-1]:.2f}s "
                 f"必须小于视频时长 {duration:.2f}s"
             )
+        raw_cue_windows = item.get("cue_windows")
+        cue_windows = None
+        if raw_cue_windows is not None:
+            if not isinstance(raw_cue_windows, list) or len(raw_cue_windows) != len(times):
+                raise SystemExit(
+                    f"images[{index}].cue_windows 必须与 times 一一对应"
+                )
+            cue_windows = []
+            for cue_index, raw_window in enumerate(raw_cue_windows):
+                if isinstance(raw_window, dict):
+                    raw_window = [raw_window.get("start"), raw_window.get("end")]
+                window = bounded_window(
+                    raw_window,
+                    raw_window,
+                    duration,
+                    f"images[{index}].cue_windows[{cue_index}]",
+                )
+                if not window[0] <= times[cue_index] <= window[1]:
+                    raise SystemExit(
+                        f"images[{index}].times[{cue_index}] 必须位于对应 cue_window 内"
+                    )
+                cue_windows.append(window)
         raw_candidates = item.get("hero_candidates", [])
         if not isinstance(raw_candidates, list):
             raise SystemExit(f"images[{index}].hero_candidates 必须是数组")
@@ -1257,6 +1367,7 @@ def command_render(args):
                 "theme_window": windows["theme"],
                 "speaking_window": windows["speaking"],
                 "speaking_window_verified": "speaking_window" in item,
+                "cue_windows": cue_windows,
             }
         )
 
@@ -1429,9 +1540,10 @@ def command_render(args):
             ),
         )
 
+        render_times = list(times)
         render_report = render_one(
             video,
-            times,
+            render_times,
             out_path,
             args.aspect,
             args.width,
@@ -1444,8 +1556,196 @@ def command_render(args):
         expected_height = round(args.width * args.aspect[1] / args.aspect[0])
         with Image.open(out_path) as rendered:
             dimensions_ok = rendered.size == (args.width, expected_height)
-        subtitle_ok = render_report["subtitle_horizontal_retention"] >= 0.98
-        if not subtitle_ok and layout != "preserve-band":
+            rendered_copy = rendered.convert("RGB")
+        strip_presence = FINAL_QA.assess_native_strips(
+            rendered_copy,
+            hero_height=render_report["hero_height"],
+            strip_heights=render_report["strip_heights"],
+        )
+        temporal_evidence = [None] * len(render_report["strip_heights"])
+        failed_strips = [
+            item["index"] - 1
+            for item in strip_presence["items"]
+            if not item["passed"]
+        ]
+        if failed_strips and job["cue_windows"] is not None:
+            repaired_bands = [list(value) for value in render_report["strip_bands"]]
+            repaired_any = False
+            for strip_index in failed_strips:
+                time_index = strip_index + 1
+                cue_start, _cue_end = job["cue_windows"][time_index]
+                active_frame = grab_frame(video, render_times[time_index])
+                pre_cue_frame = grab_frame(video, max(0.0, cue_start - 0.18))
+                evidence = FINAL_QA.detect_temporal_subtitle_band(
+                    active_frame,
+                    pre_cue_frame,
+                    configured_band=repaired_bands[strip_index],
+                )
+                temporal_evidence[strip_index] = evidence
+                if evidence["detected"]:
+                    repaired_bands[strip_index] = [
+                        evidence["top"], evidence["bottom"]
+                    ]
+                    evidence["final_band_overlap"] = 1.0
+                    repaired_any = True
+                    emit(
+                        "auto_repair",
+                        index=index,
+                        action="dynamic-strip-band",
+                        phase="layout_crop",
+                        strip_index=strip_index + 1,
+                        reason="final_native_strip_presence_failed",
+                        original_band=render_report["strip_bands"][strip_index],
+                        repaired_band=repaired_bands[strip_index],
+                        temporal_evidence=evidence,
+                    )
+                else:
+                    evidence["final_band_overlap"] = 0.0
+            if repaired_any:
+                render_report = render_one(
+                    video,
+                    render_times,
+                    out_path,
+                    args.aspect,
+                    args.width,
+                    args.band_top,
+                    args.band_bottom,
+                    args.hero_fraction,
+                    hero_frame=selection["frame"],
+                    native_layout=layout,
+                    strip_bands=repaired_bands,
+                )
+                with Image.open(out_path) as rendered:
+                    rendered_copy = rendered.convert("RGB")
+                strip_presence = FINAL_QA.assess_native_strips(
+                    rendered_copy,
+                    hero_height=render_report["hero_height"],
+                    strip_heights=render_report["strip_heights"],
+                    temporal_evidence=temporal_evidence,
+                )
+        # If the planned midpoint itself has no subtitle pixels, probe a fixed
+        # set of times inside that cue only.  This is the semantic-window
+        # repair stage: it cannot borrow text from another cue or source.
+        remaining_failed = [
+            item["index"] - 1
+            for item in strip_presence["items"]
+            if not item["passed"]
+        ]
+        cue_probe_attempted = False
+        if remaining_failed and job["cue_windows"] is not None:
+            working_bands = [list(value) for value in render_report["strip_bands"]]
+            for strip_index in remaining_failed:
+                time_index = strip_index + 1
+                cue_start, cue_end = job["cue_windows"][time_index]
+                span = cue_end - cue_start
+                probe_times = []
+                for fraction in (0.15, 0.30, 0.50, 0.70, 0.85):
+                    value = round(cue_start + span * fraction, 3)
+                    if (
+                        cue_start <= value <= cue_end
+                        and abs(value - render_times[time_index]) >= 0.02
+                        and value not in probe_times
+                    ):
+                        probe_times.append(value)
+                accepted_probe = None
+                for probe_time in probe_times:
+                    cue_probe_attempted = True
+                    active_frame = grab_frame(video, probe_time)
+                    pre_cue_frame = grab_frame(video, max(0.0, cue_start - 0.18))
+                    evidence = FINAL_QA.detect_temporal_subtitle_band(
+                        active_frame,
+                        pre_cue_frame,
+                        configured_band=working_bands[strip_index],
+                    )
+                    trial_bands = [list(value) for value in working_bands]
+                    if evidence["detected"]:
+                        trial_bands[strip_index] = [evidence["top"], evidence["bottom"]]
+                        evidence["final_band_overlap"] = 1.0
+                    else:
+                        evidence["final_band_overlap"] = 0.0
+                    trial_times = list(render_times)
+                    trial_times[time_index] = probe_time
+                    trial_report = render_one(
+                        video,
+                        trial_times,
+                        out_path,
+                        args.aspect,
+                        args.width,
+                        args.band_top,
+                        args.band_bottom,
+                        args.hero_fraction,
+                        hero_frame=selection["frame"],
+                        native_layout=layout,
+                        strip_bands=trial_bands,
+                    )
+                    with Image.open(out_path) as rendered:
+                        trial_rendered = rendered.convert("RGB")
+                    trial_evidence = list(temporal_evidence)
+                    trial_evidence[strip_index] = evidence
+                    trial_presence = FINAL_QA.assess_native_strips(
+                        trial_rendered,
+                        hero_height=trial_report["hero_height"],
+                        strip_heights=trial_report["strip_heights"],
+                        temporal_evidence=trial_evidence,
+                    )
+                    if trial_presence["items"][strip_index]["passed"]:
+                        accepted_probe = (
+                            probe_time,
+                            trial_times,
+                            trial_bands,
+                            trial_evidence,
+                            trial_report,
+                            trial_rendered,
+                            trial_presence,
+                        )
+                        break
+                if accepted_probe is not None:
+                    (
+                        probe_time,
+                        render_times,
+                        working_bands,
+                        temporal_evidence,
+                        render_report,
+                        rendered_copy,
+                        strip_presence,
+                    ) = accepted_probe
+                    emit(
+                        "auto_repair",
+                        index=index,
+                        action="same-cue-window-time",
+                        phase="semantic_window",
+                        strip_index=strip_index + 1,
+                        original_time=times[time_index],
+                        repaired_time=probe_time,
+                        cue_window=[cue_start, cue_end],
+                        reason="planned_cue_time_missing_final_subtitle_evidence",
+                    )
+            if cue_probe_attempted:
+                # The last rejected probe also wrote the output.  Re-render
+                # the accumulated accepted state before final QA.
+                render_report = render_one(
+                    video,
+                    render_times,
+                    out_path,
+                    args.aspect,
+                    args.width,
+                    args.band_top,
+                    args.band_bottom,
+                    args.hero_fraction,
+                    hero_frame=selection["frame"],
+                    native_layout=layout,
+                    strip_bands=working_bands,
+                )
+                with Image.open(out_path) as rendered:
+                    rendered_copy = rendered.convert("RGB")
+                strip_presence = FINAL_QA.assess_native_strips(
+                    rendered_copy,
+                    hero_height=render_report["hero_height"],
+                    strip_heights=render_report["strip_heights"],
+                    temporal_evidence=temporal_evidence,
+                )
+        horizontal_ok = render_report["subtitle_horizontal_retention"] >= 0.98
+        if not horizontal_ok and layout != "preserve-band":
             emit(
                 "auto_repair",
                 index=index,
@@ -1454,7 +1754,7 @@ def command_render(args):
             )
             render_report = render_one(
                 video,
-                times,
+                render_times,
                 out_path,
                 args.aspect,
                 args.width,
@@ -1463,14 +1763,51 @@ def command_render(args):
                 args.hero_fraction,
                 hero_frame=selection["frame"],
                 native_layout="preserve-band",
+                strip_bands=render_report["strip_bands"],
             )
             layout = "preserve-band"
-            subtitle_ok = render_report["subtitle_horizontal_retention"] >= 0.98
+            with Image.open(out_path) as rendered:
+                rendered_copy = rendered.convert("RGB")
+            strip_presence = FINAL_QA.assess_native_strips(
+                rendered_copy,
+                hero_height=render_report["hero_height"],
+                strip_heights=render_report["strip_heights"],
+                temporal_evidence=temporal_evidence,
+            )
+            horizontal_ok = render_report["subtitle_horizontal_retention"] >= 0.98
+        subtitle_ok = horizontal_ok and strip_presence["all_pass"]
+
+        qa_source = (
+            selection["frame"]
+            if render_report["hero_source_kind"] == "selected_hero_frame"
+            else grab_frame(video, times[0])
+        )
+        final_renderability = FINAL_QA.assess_final_renderability(
+            qa_source,
+            rendered_copy,
+            source_crop_box=render_report["hero_source_crop_box"],
+            hero_box=render_report["hero_content_box"],
+            source_visual=(
+                None
+                if args.visual_gate == "off"
+                else public_assessment(visual_assessment(qa_source))
+            ),
+            layout_mode=(
+                "quote_first"
+                if layout == "quote-first"
+                else "contain"
+                if layout == "centered-band"
+                else "fit"
+            ),
+        )
 
         visual_ok = (
-            layout == "quote-first"
-            or selection["assessment"]["passed"]
-            or args.visual_gate == "off"
+            final_renderability["final_renderability"]["passed"]
+            and (
+                layout == "quote-first"
+                or selection["assessment"]["passed"]
+                or args.visual_gate == "off"
+            )
         )
         semantic_alignment = selection.get("semantic_alignment", "PASS")
         passed = (
@@ -1500,6 +1837,8 @@ def command_render(args):
                 "file": out_path.name,
                 "result": result,
                 "original_time": times[0],
+                "planned_times": times,
+                "render_times": render_times,
                 "hero_time": selection["time"],
                 "repair_phase": phase,
                 "layout": layout,
@@ -1513,6 +1852,8 @@ def command_render(args):
                     "subtitle_horizontal_retention"
                 ],
                 "subtitle_integrity": "PASS" if subtitle_ok else "FAIL",
+                "native_subtitle_presence": strip_presence,
+                "strip_bands": render_report["strip_bands"],
                 "subtitle_strip_strategy": render_report[
                     "subtitle_strip_strategy"
                 ],
@@ -1524,6 +1865,7 @@ def command_render(args):
                     else "selected_video_frame"
                 ),
                 "visual_strategy_ok": visual_ok,
+                "final_renderability": final_renderability,
                 "quote_detection": render_report["quote_detection"],
                 "note": (
                     "同源全片视觉 fallback；字幕仍来自原时间点，主题对应需人工确认"
@@ -1596,12 +1938,21 @@ def command_render_script(args):
         ) from None
     lines = normalize_script_lines(data, duration)
     out_path = Path(args.out).expanduser().resolve()
-    refuse_existing([out_path], args.overwrite)
+    qa_path = out_path.with_name(out_path.stem + ".qa-results.json")
+    decisions_path = out_path.with_name(out_path.stem + ".render-decisions.jsonl")
+    refuse_existing([out_path, qa_path, decisions_path], args.overwrite)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     font_path = None
     if args.font:
         font_path = str(input_file(args.font, "字体"))
-    scripted_render_one(
+    events = []
+
+    def emit(event, **details):
+        events.append({"sequence": len(events) + 1, "event": event, **details})
+
+    first_frame = grab_frame(video, lines[0]["t"])
+    source_visual = visual_assessment(first_frame)
+    report = scripted_render_one(
         video,
         lines,
         out_path,
@@ -1611,7 +1962,101 @@ def command_render_script(args):
         args.hero_fraction,
         font_path,
         args.font_size,
+        hero_layout="fit",
     )
+    with Image.open(out_path) as opened:
+        rendered = opened.convert("RGB")
+    initial_qa = FINAL_QA.assess_final_renderability(
+        first_frame,
+        rendered,
+        source_crop_box=report["source_crop_box"],
+        hero_box=report["hero_box"],
+        source_visual=public_assessment(source_visual),
+        layout_mode="fit",
+    )
+    portrait_crop = (
+        first_frame.width / first_frame.height
+        > args.width / report["hero_height"] + 0.03
+    )
+    unknown_subject_in_crop = (
+        portrait_crop and source_visual.get("subject_center_x") is None
+    )
+    initial_passed = (
+        initial_qa["final_renderability"]["passed"]
+        and not unknown_subject_in_crop
+    )
+    emit(
+        "qa_result",
+        stage="initial",
+        layout="fit",
+        passed=initial_passed,
+        unknown_subject_in_portrait_crop=unknown_subject_in_crop,
+        final_renderability=initial_qa,
+        source_visual=public_assessment(source_visual),
+    )
+    repaired = False
+    final_qa = initial_qa
+    if not initial_passed:
+        repaired = True
+        emit(
+            "auto_repair",
+            stage="layout_crop",
+            action="contain-blur-hero",
+            reason="fit_layout_final_renderability_failed",
+        )
+        report = scripted_render_one(
+            video,
+            lines,
+            out_path,
+            args.aspect,
+            args.width,
+            args.band_center,
+            args.hero_fraction,
+            font_path,
+            args.font_size,
+            hero_layout="contain",
+        )
+        with Image.open(out_path) as opened:
+            rendered = opened.convert("RGB")
+        final_qa = FINAL_QA.assess_final_renderability(
+            first_frame,
+            rendered,
+            source_crop_box=report["source_crop_box"],
+            hero_box=report["hero_box"],
+            source_visual=public_assessment(source_visual),
+            layout_mode="contain",
+        )
+        emit(
+            "qa_result",
+            stage="layout_crop",
+            layout="contain",
+            passed=final_qa["final_renderability"]["passed"],
+            final_renderability=final_qa,
+        )
+    qa_payload = {
+        "overall": (
+            "PASS" if final_qa["final_renderability"]["passed"] else "FAIL"
+        ),
+        "mode": "script",
+        "file": out_path.name,
+        "layout": report["layout"],
+        "layout_repaired": repaired,
+        "source_visual": public_assessment(source_visual),
+        "initial_final_renderability": initial_qa,
+        "final_renderability": final_qa,
+    }
+    qa_path.write_text(
+        json.dumps(qa_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    decisions_path.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    print(f"逐图 QA: {qa_path} ({qa_payload['overall']})")
+    print(f"决策日志: {decisions_path}")
+    if qa_payload["overall"] == "FAIL":
+        raise SystemExit("final renderability QA 失败；详情见 QA sidecar")
 
 
 def main():

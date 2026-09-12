@@ -554,6 +554,12 @@ class CliIntegrationTests(unittest.TestCase):
                     "lavfi",
                     "-i",
                     "testsrc2=size=640x360:rate=10",
+                    "-vf",
+                    "drawbox=x=120:y=295:w=45:h=18:color=white:t=fill,"
+                    "drawbox=x=190:y=295:w=45:h=18:color=white:t=fill,"
+                    "drawbox=x=260:y=295:w=45:h=18:color=white:t=fill,"
+                    "drawbox=x=330:y=295:w=45:h=18:color=white:t=fill,"
+                    "drawbox=x=400:y=295:w=45:h=18:color=white:t=fill",
                     "-t",
                     "3",
                     "-c:v",
@@ -721,6 +727,13 @@ class CliIntegrationTests(unittest.TestCase):
             )
             with Image.open(scripted_output) as rendered:
                 self.assertEqual(rendered.size, (300, 400))
+            self.assertTrue((tmp_path / "scripted.qa-results.json").is_file())
+            self.assertTrue((tmp_path / "scripted.render-decisions.jsonl").is_file())
+            scripted_qa = json.loads(
+                (tmp_path / "scripted.qa-results.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(scripted_qa["overall"], "PASS")
+            self.assertIn("final_renderability", scripted_qa)
 
             repeated = subprocess.run(
                 [
