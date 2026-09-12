@@ -284,6 +284,24 @@ python3 skills/native-subtitle-quote-image/scripts/native_subtitle_stitch.py ren
   --band-top 0.78 --band-bottom 0.96
 ```
 
+原生模式的 `render` 默认在 final 入选前运行轻量 visual gate，并在原帧失败时按“同句附近、同主题候选、全片稀疏候选”顺序自动换主图。它也会根据字幕带位置选择底部或居中布局，并把完整宽度的原生字幕带保留在主图中。每次候选拒绝、换帧和布局降级都会写入 `render-decisions.jsonl`，逐图结论写入 `qa-results.json`。全片 fallback 会标为 `PARTIAL_PASS`，因为视觉与字幕检查已通过，但主题对应仍需人工确认。设计与边界见 [Phase 1 说明](docs/PHASE1-ADAPTIVE-VISUAL-QA.md)。
+
+manifest 可为某个主题提供可选的主图候选：
+
+```json
+{
+  "images": [
+    {
+      "title": "主题",
+      "times": [61.6, 69.3, 75.0, 82.4, 88.8],
+      "hero_candidates": [60.8, 62.4]
+    }
+  ]
+}
+```
+
+需要复现无 visual gate 的旧式执行入口时可传 `--visual-gate off`；`--native-layout legacy` 会先尝试上游裁切，但字幕横向保留不足时仍由 QA 自动降级。
+
 ### 脚本字幕渲染
 
 `script.json` 的每个 `text` 都必须是已复核的单行台词，`t` 是严格递增的真实时间点：

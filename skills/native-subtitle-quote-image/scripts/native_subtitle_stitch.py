@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 
 try:
     import imageio_ffmpeg
@@ -275,7 +275,293 @@ def choose_hero_fraction(strip_count, requested=None):
     return min(0.82, max(0.48, 1.0 - strip_count * 0.075))
 
 
-def render_one(video, times, out_path, aspect, out_width, top, bottom, hero_fraction):
+def classify_native_layout(top, bottom, low_visual=False):
+    """根据字幕带位置和视觉价值选择原生字幕主图布局。"""
+    if low_visual:
+        return "low-visual-fallback"
+    return "bottom-band" if (top + bottom) / 2 >= 0.68 else "centered-band"
+
+
+def visual_assessment(frame):
+    """用轻量、可解释的图像统计拒绝黑场、空镜和低信息量画面。"""
+    sample = frame.convert("RGB").resize((160, 90), Image.Resampling.BILINEAR)
+    gray = sample.convert("L")
+    gray_stat = ImageStat.Stat(gray)
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    histogram = gray.histogram()
+    dark_ratio = sum(histogram[:32]) / sum(histogram)
+    entropy = gray.entropy()
+    luminance_std = gray_stat.stddev[0]
+    edge_mean = ImageStat.Stat(edges).mean[0]
+    saturation_mean = ImageStat.Stat(sample.convert("HSV").getchannel("S")).mean[0]
+    raw_rgb = sample.tobytes()
+    skin_mask = [
+        red > 95
+        and green > 40
+        and blue > 20
+        and max(red, green, blue) - min(red, green, blue) > 15
+        and abs(red - green) > 15
+        and red > green
+        and red > blue
+        for red, green, blue in zip(raw_rgb[::3], raw_rgb[1::3], raw_rgb[2::3])
+    ]
+    skin_tone_ratio = sum(skin_mask) / (sample.width * sample.height)
+    subject_center_x = largest_interior_component_center(
+        skin_mask, sample.width, sample.height, max_y=round(sample.height * 0.60)
+    )
+    score = (
+        min(1.0, max(0.0, (entropy - 4.5) / 2.5)) * 0.30
+        + min(1.0, max(0.0, (luminance_std - 18.0) / 45.0)) * 0.25
+        + min(1.0, max(0.0, (edge_mean - 15.0) / 25.0)) * 0.20
+        + min(1.0, max(0.0, (0.90 - dark_ratio) / 0.80)) * 0.25
+    )
+    reasons = []
+    if dark_ratio >= 0.82:
+        reasons.append("dark_or_empty")
+    if entropy < 5.5:
+        reasons.append("low_entropy")
+    if luminance_std < 25.0:
+        reasons.append("low_luminance_variation")
+    if score < 0.34:
+        reasons.append("low_visual_score")
+    passed = not reasons
+    signature = sample.resize((48, 27), Image.Resampling.BILINEAR)
+    return {
+        "passed": passed,
+        "score": round(score, 4),
+        "entropy": round(entropy, 4),
+        "luminance_std": round(luminance_std, 4),
+        "edge_mean": round(edge_mean, 4),
+        "saturation_mean": round(saturation_mean, 4),
+        "skin_tone_ratio": round(skin_tone_ratio, 4),
+        "subject_center_x": (
+            round(subject_center_x, 4) if subject_center_x is not None else None
+        ),
+        "dark_ratio": round(dark_ratio, 4),
+        "reasons": reasons,
+        "signature": signature,
+    }
+
+
+def largest_interior_component_center(mask, width, height, max_y=None):
+    """找上部画面内不接触左右边缘的最大连通区域，返回横向中心比例。"""
+    max_y = height if max_y is None else min(height, max(1, max_y))
+    visited = set()
+    best = None
+    for y in range(max_y):
+        for x in range(width):
+            start = y * width + x
+            if not mask[start] or start in visited:
+                continue
+            stack = [start]
+            visited.add(start)
+            points = []
+            touches_side = False
+            while stack:
+                current = stack.pop()
+                points.append(current)
+                current_y, current_x = divmod(current, width)
+                touches_side = touches_side or current_x in {0, width - 1}
+                for next_x, next_y in (
+                    (current_x - 1, current_y),
+                    (current_x + 1, current_y),
+                    (current_x, current_y - 1),
+                    (current_x, current_y + 1),
+                ):
+                    if not (0 <= next_x < width and 0 <= next_y < max_y):
+                        continue
+                    neighbor = next_y * width + next_x
+                    if mask[neighbor] and neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+            if touches_side or len(points) < 20:
+                continue
+            if best is None or len(points) > len(best):
+                best = points
+    if best is None:
+        return None
+    return sum(point % width for point in best) / len(best) / max(1, width - 1)
+
+
+def subject_aware_centering(source, target_size, subject_center_x):
+    """把估计主体放进 portrait crop，返回 Pillow ImageOps.fit 的 centering。"""
+    if subject_center_x is None:
+        return 0.5
+    target_width, target_height = target_size
+    crop_width = source.height * target_width / target_height
+    extra_width = source.width - crop_width
+    if extra_width <= 0:
+        return 0.5
+    desired_left = subject_center_x * source.width - crop_width / 2
+    return min(1.0, max(0.0, desired_left / extra_width))
+
+
+def visual_distance(left, right):
+    """返回 0–1 的缩略图平均绝对差，用于阻止 final 画面近重复。"""
+    difference = ImageChops.difference(left.convert("RGB"), right.convert("RGB"))
+    mean = ImageStat.Stat(difference).mean
+    return sum(mean) / (len(mean) * 255.0)
+
+
+def candidate_groups(original, explicit, duration):
+    latest = max(0.0, duration - min(0.5, duration / 10))
+
+    def valid(values):
+        seen = set()
+        result = []
+        for value in values:
+            value = round(max(0.0, min(latest, float(value))), 3)
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+        return result
+
+    return [
+        ("original", valid([original])),
+        (
+            "same-line-nearby",
+            valid([original - 0.8, original + 0.8, original - 1.5, original + 1.5]),
+        ),
+        (
+            "same-theme-candidate",
+            valid(
+                [
+                    *explicit,
+                    original - 4,
+                    original + 4,
+                    original - 10,
+                    original + 10,
+                    original - 20,
+                    original + 20,
+                    original - 30,
+                    original + 30,
+                ]
+            ),
+        ),
+    ]
+
+
+def global_candidate_times(duration, count):
+    if count <= 0:
+        raise SystemExit("--global-candidates 必须为正整数")
+    latest = max(0.0, duration - min(0.5, duration / 10))
+    return [round(latest * (index + 0.5) / count, 3) for index in range(count)]
+
+
+def public_assessment(assessment):
+    return {key: value for key, value in assessment.items() if key != "signature"}
+
+
+def choose_visual_hero(
+    video,
+    original,
+    explicit,
+    duration,
+    used_signatures,
+    global_times,
+    emit,
+    global_cache=None,
+    minimum_distance=0.035,
+):
+    """按原帧、同句、同主题、全片候选顺序执行 visual gate 与修复。"""
+    groups = candidate_groups(original, explicit, duration)
+    groups.append(("source-wide-fallback", global_times))
+    attempted = set()
+
+    def evaluate(phase, seconds):
+        if seconds in attempted:
+            return None
+        attempted.add(seconds)
+        cached = global_cache.get(seconds) if global_cache is not None else None
+        if phase == "source-wide-fallback" and cached is not None:
+            frame, assessment = cached
+        else:
+            frame = grab_frame(video, seconds)
+            assessment = visual_assessment(frame)
+            if phase == "source-wide-fallback" and global_cache is not None:
+                global_cache[seconds] = (frame, assessment)
+        distances = [
+            visual_distance(assessment["signature"], previous)
+            for previous in used_signatures
+        ]
+        nearest = min(distances) if distances else 1.0
+        diverse = nearest >= minimum_distance
+        accepted = assessment["passed"] and diverse
+        reasons = list(assessment["reasons"])
+        if assessment["passed"] and not diverse:
+            reasons.append("near_duplicate_final")
+        emit(
+            "visual_gate",
+            phase=phase,
+            time=seconds,
+            accepted=accepted,
+            nearest_final_distance=round(nearest, 4),
+            reasons=reasons,
+            metrics=public_assessment(assessment),
+        )
+        if not accepted:
+            return None
+        return (assessment["score"], nearest, seconds, frame, assessment)
+
+    for phase, values in groups:
+        passing = []
+        for seconds in values:
+            candidate = evaluate(phase, seconds)
+            if candidate is not None:
+                passing.append(candidate)
+        if phase == "source-wide-fallback" and passing:
+            latest = max(0.0, duration - min(0.5, duration / 10))
+            anchors = [
+                item[2]
+                for item in passing
+                if item[4]["skin_tone_ratio"] >= 0.10
+            ]
+            for anchor in anchors:
+                for offset in (-6.0, -3.0, 3.0, 6.0):
+                    seconds = round(max(0.0, min(latest, anchor + offset)), 3)
+                    candidate = evaluate(phase, seconds)
+                    if candidate is not None:
+                        passing.append(candidate)
+        if passing:
+            if phase == "source-wide-fallback":
+                rank = lambda item: (
+                    item[4]["skin_tone_ratio"] >= 0.10,
+                    item[4]["skin_tone_ratio"],
+                    item[0],
+                    item[1],
+                )
+            else:
+                rank = lambda item: (item[0], item[1])
+            _, _, seconds, frame, assessment = max(passing, key=rank)
+            if phase != "original":
+                emit(
+                    "auto_repair",
+                    action=phase,
+                    original_time=original,
+                    replacement_time=seconds,
+                    reason="original_visual_gate_failed",
+                )
+            return {
+                "time": seconds,
+                "frame": frame,
+                "assessment": assessment,
+                "phase": phase,
+            }
+    return None
+
+
+def render_one(
+    video,
+    times,
+    out_path,
+    aspect,
+    out_width,
+    top,
+    bottom,
+    hero_fraction,
+    hero_frame=None,
+    native_layout="legacy",
+):
     times = normalize_times(times)
     aw, ah = aspect
     out_height = round(out_width * ah / aw)
@@ -288,15 +574,52 @@ def render_one(video, times, out_path, aspect, out_width, top, bottom, hero_frac
     strip_heights[-1] += remaining - sum(strip_heights)
 
     first = grab_frame(video, times[0])
-    _, _, subtitle_bottom = crop_band(first, top, bottom)
-    wanted_hero_source_h = min(
-        subtitle_bottom,
-        max(1, round(first.width * hero_height / out_width)),
-    )
-    hero_source = first.crop(
-        (0, subtitle_bottom - wanted_hero_source_h, first.width, subtitle_bottom)
-    )
-    hero = fit_lower(hero_source, (out_width, hero_height), vertical=0.75)
+    band, _, subtitle_bottom = crop_band(first, top, bottom)
+    if native_layout == "legacy":
+        wanted_hero_source_h = min(
+            subtitle_bottom,
+            max(1, round(first.width * hero_height / out_width)),
+        )
+        hero_source = first.crop(
+            (0, subtitle_bottom - wanted_hero_source_h, first.width, subtitle_bottom)
+        )
+        hero = fit_lower(hero_source, (out_width, hero_height), vertical=0.75)
+        visible_source_width = min(
+            first.width, round(wanted_hero_source_h * out_width / hero_height)
+        )
+        subtitle_horizontal_retention = visible_source_width / first.width
+        band_height = None
+    else:
+        visual_source = hero_frame or first
+        subject_center_x = None
+        if native_layout == "low-visual-fallback":
+            subject_center_x = visual_assessment(visual_source)["subject_center_x"]
+            visual_source = visual_source.crop(
+                (0, 0, visual_source.width, round(visual_source.height * 0.60))
+            )
+        natural_band_height = max(1, round(band.height * out_width / band.width))
+        maximum_band_height = max(1, round(hero_height * 0.32))
+        band_height = min(natural_band_height, maximum_band_height)
+        visual_height = hero_height - band_height
+        if visual_height < round(hero_height * 0.55):
+            raise ValueError("字幕带过高，无法保留足够的主画面空间")
+        vertical = 0.56 if native_layout == "bottom-band" else 0.48
+        horizontal = subject_aware_centering(
+            visual_source, (out_width, visual_height), subject_center_x
+        )
+        visual = ImageOps.fit(
+            visual_source,
+            (out_width, visual_height),
+            method=Image.Resampling.LANCZOS,
+            centering=(horizontal, vertical),
+        )
+        preserved_band = band.resize(
+            (out_width, band_height), Image.Resampling.LANCZOS
+        )
+        hero = Image.new("RGB", (out_width, hero_height), "black")
+        hero.paste(visual, (0, 0))
+        hero.paste(preserved_band, (0, visual_height))
+        subtitle_horizontal_retention = 1.0
 
     strips = []
     for seconds, height in zip(times[1:], strip_heights):
@@ -313,9 +636,20 @@ def render_one(video, times, out_path, aspect, out_width, top, bottom, hero_frac
     canvas.save(out_path, quality=93, subsampling=0)
     print(f"完成: {out_path} ({out_width}x{out_height})")
     print(
-        f"布局: 主画面 {hero_fraction:.1%}，"
-        f"字幕条 {strip_count} 个，条间距 0"
+        f"布局: {native_layout}；主画面 {hero_fraction:.1%}，"
+        f"字幕条 {strip_count} 个，条间距 0，"
+        f"主字幕横向保留 {subtitle_horizontal_retention:.1%}"
     )
+    return {
+        "layout": native_layout,
+        "hero_fraction": hero_fraction,
+        "hero_height": hero_height,
+        "band_height": band_height,
+        "subtitle_horizontal_retention": round(subtitle_horizontal_retention, 4),
+        "visual_centering_x": (
+            round(horizontal, 4) if native_layout != "legacy" else 0.5
+        ),
+    }
 
 
 def scripted_render_one(
@@ -589,20 +923,133 @@ def command_render(args):
                 f"images[{index}].times 的最后时间点 {times[-1]:.2f}s "
                 f"必须小于视频时长 {duration:.2f}s"
             )
-        jobs.append((index, title, times))
+        raw_candidates = item.get("hero_candidates", [])
+        if not isinstance(raw_candidates, list):
+            raise SystemExit(f"images[{index}].hero_candidates 必须是数组")
+        hero_candidates = [
+            validate_time(value, f"images[{index}].hero_candidates[{candidate_index}]")
+            for candidate_index, value in enumerate(raw_candidates)
+        ]
+        if any(value >= duration for value in hero_candidates):
+            raise SystemExit(
+                f"images[{index}].hero_candidates 必须全部小于视频时长 {duration:.2f}s"
+            )
+        jobs.append(
+            {
+                "index": index,
+                "title": title,
+                "times": times,
+                "hero_candidates": hero_candidates,
+            }
+        )
 
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    outputs = [out_dir / f"{index:02d}_{title}.jpg" for index, title, _ in jobs]
+    outputs = [
+        out_dir / f"{job['index']:02d}_{job['title']}.jpg" for job in jobs
+    ]
     manifest_target = out_dir / "原生字幕时间点.json"
     contact_target = out_dir / "final_contact_sheet.jpg"
-    guarded = [*outputs, contact_target]
+    qa_target = out_dir / "qa-results.json"
+    decisions_target = out_dir / "render-decisions.jsonl"
+    guarded = [*outputs, contact_target, qa_target, decisions_target]
     if manifest_path != manifest_target:
         guarded.append(manifest_target)
     refuse_existing(guarded, args.overwrite)
 
-    for (_, _, times), out_path in zip(jobs, outputs):
-        render_one(
+    events = []
+    qa_items = []
+    accepted_outputs = []
+    used_signatures = []
+    global_times = global_candidate_times(duration, args.global_candidates)
+    global_cache = {}
+
+    def emit(event, **details):
+        payload = {"event": event, **details}
+        events.append(payload)
+        summary = ", ".join(
+            f"{key}={value}"
+            for key, value in details.items()
+            if key in {"index", "phase", "time", "accepted", "action", "layout", "result", "reason"}
+        )
+        print(f"[{event}] {summary}")
+
+    for job, out_path in zip(jobs, outputs):
+        index = job["index"]
+        title = job["title"]
+        times = job["times"]
+        emit("item_start", index=index, title=title, time=times[0])
+        if args.visual_gate == "off":
+            hero_frame = grab_frame(video, times[0])
+            assessment = visual_assessment(hero_frame)
+            selection = {
+                "time": times[0],
+                "frame": hero_frame,
+                "assessment": assessment,
+                "phase": "visual-gate-off",
+            }
+            emit(
+                "visual_gate",
+                index=index,
+                phase="visual-gate-off",
+                time=times[0],
+                accepted=True,
+                metrics=public_assessment(assessment),
+            )
+        else:
+            selection = choose_visual_hero(
+                video,
+                times[0],
+                job["hero_candidates"],
+                duration,
+                used_signatures,
+                global_times,
+                lambda event, **details: emit(event, index=index, **details),
+                global_cache=global_cache,
+                minimum_distance=args.minimum_visual_distance,
+            )
+        if selection is None:
+            reason = "所有同句、同主题和全片候选均未通过 visual gate"
+            emit("qa", index=index, result="FAIL", reason=reason)
+            qa_items.append(
+                {
+                    "index": index,
+                    "title": title,
+                    "file": None,
+                    "result": "FAIL",
+                    "reason": reason,
+                    "original_time": times[0],
+                }
+            )
+            continue
+
+        phase = selection["phase"]
+        if args.native_layout == "auto":
+            layout = classify_native_layout(
+                args.band_top,
+                args.band_bottom,
+                low_visual=phase not in {"original", "visual-gate-off"},
+            )
+        elif args.native_layout == "bottom":
+            layout = "bottom-band"
+        elif args.native_layout == "centered":
+            layout = "centered-band"
+        elif args.native_layout == "preserve":
+            layout = "preserve-band"
+        else:
+            layout = "legacy"
+        emit(
+            "layout",
+            index=index,
+            layout=layout,
+            reason=(
+                "low_visual_candidate_replaced"
+                if phase not in {"original", "visual-gate-off"}
+                else "subtitle_band_position"
+            ),
+        )
+
+        render_report = render_one(
             video,
             times,
             out_path,
@@ -611,12 +1058,103 @@ def command_render(args):
             args.band_top,
             args.band_bottom,
             args.hero_fraction,
+            hero_frame=selection["frame"],
+            native_layout=layout,
         )
+        expected_height = round(args.width * args.aspect[1] / args.aspect[0])
+        with Image.open(out_path) as rendered:
+            dimensions_ok = rendered.size == (args.width, expected_height)
+        subtitle_ok = render_report["subtitle_horizontal_retention"] >= 0.98
+        if not subtitle_ok and layout != "preserve-band":
+            emit(
+                "auto_repair",
+                index=index,
+                action="layout-degrade",
+                reason="subtitle_horizontal_retention_below_98_percent",
+            )
+            render_report = render_one(
+                video,
+                times,
+                out_path,
+                args.aspect,
+                args.width,
+                args.band_top,
+                args.band_bottom,
+                args.hero_fraction,
+                hero_frame=selection["frame"],
+                native_layout="preserve-band",
+            )
+            layout = "preserve-band"
+            subtitle_ok = render_report["subtitle_horizontal_retention"] >= 0.98
+
+        visual_ok = selection["assessment"]["passed"] or args.visual_gate == "off"
+        passed = dimensions_ok and subtitle_ok and visual_ok
+        if not passed:
+            result = "FAIL"
+        elif phase == "source-wide-fallback":
+            result = "PARTIAL_PASS"
+        else:
+            result = "PASS"
+        emit("qa", index=index, result=result, layout=layout)
+        qa_items.append(
+            {
+                "index": index,
+                "title": title,
+                "file": out_path.name,
+                "result": result,
+                "original_time": times[0],
+                "hero_time": selection["time"],
+                "repair_phase": phase,
+                "layout": layout,
+                "dimensions_ok": dimensions_ok,
+                "subtitle_horizontal_retention": render_report[
+                    "subtitle_horizontal_retention"
+                ],
+                "visual_centering_x": render_report["visual_centering_x"],
+                "hero_visual": public_assessment(selection["assessment"]),
+                "note": (
+                    "同源全片视觉 fallback；字幕仍来自原时间点，主题对应需人工确认"
+                    if phase == "source-wide-fallback"
+                    else None
+                ),
+            }
+        )
+        if passed:
+            accepted_outputs.append(out_path)
+            used_signatures.append(selection["assessment"]["signature"])
 
     if manifest_path != manifest_target:
         shutil.copyfile(manifest_path, manifest_target)
-    contact_sheet(outputs, contact_target)
-    print(f"总览图: {contact_target}")
+    if accepted_outputs:
+        contact_sheet(accepted_outputs, contact_target)
+        print(f"总览图: {contact_target}")
+    overall = (
+        "FAIL"
+        if any(item["result"] == "FAIL" for item in qa_items)
+        else "PARTIAL_PASS"
+        if any(item["result"] == "PARTIAL_PASS" for item in qa_items)
+        else "PASS"
+    )
+    qa_payload = {
+        "overall": overall,
+        "mode": "native",
+        "expected_images": len(jobs),
+        "accepted_images": len(accepted_outputs),
+        "visual_gate": args.visual_gate,
+        "items": qa_items,
+    }
+    qa_target.write_text(
+        json.dumps(qa_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    decisions_target.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    print(f"逐图 QA: {qa_target} ({overall})")
+    print(f"决策日志: {decisions_target}")
+    if overall == "FAIL":
+        raise SystemExit("visual QA 最终仍失败；详情见 qa-results.json")
 
 
 def command_render_script(args):
@@ -702,6 +1240,30 @@ def main():
         type=float,
         help="主画面高度比例；默认按字幕条数量自动保持紧凑密度",
     )
+    render.add_argument(
+        "--native-layout",
+        choices=("auto", "bottom", "centered", "preserve", "legacy"),
+        default="auto",
+        help="原生字幕主图布局；auto 根据字幕位置与 visual gate 自适应",
+    )
+    render.add_argument(
+        "--visual-gate",
+        choices=("auto", "off"),
+        default="auto",
+        help="在 final 入选前检查空镜、低信息量和近重复画面（默认 auto）",
+    )
+    render.add_argument(
+        "--global-candidates",
+        type=int,
+        default=32,
+        help="局部修复失败后扫描的全片候选数（默认 32）",
+    )
+    render.add_argument(
+        "--minimum-visual-distance",
+        type=float,
+        default=0.035,
+        help="final 主图之间的最小平均像素差（0–1，默认 0.035）",
+    )
     render.add_argument("--overwrite", action="store_true")
     render.set_defaults(func=command_render)
 
@@ -739,6 +1301,10 @@ def main():
         raise SystemExit("--band-center 必须在 0.10–0.98 之间")
     if getattr(args, "font_size", None) is not None and args.font_size < 12:
         raise SystemExit("--font-size 不能小于 12")
+    if getattr(args, "global_candidates", 1) <= 0:
+        raise SystemExit("--global-candidates 必须为正整数")
+    if not 0 <= getattr(args, "minimum_visual_distance", 0.0) <= 1:
+        raise SystemExit("--minimum-visual-distance 必须在 0–1 之间")
     if (
         hasattr(args, "hero_fraction")
         and args.hero_fraction is not None

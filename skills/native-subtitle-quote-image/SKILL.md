@@ -129,6 +129,8 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render VIDEO \
 
 `title` 只用于文件名，不画进图片。`times` 必须来自已回看的稳定帧。输出包含逐张 JPG、`原生字幕时间点.json` 和 `final_contact_sheet.jpg`。
 
+增强版 `render` 会在 final 入选前自动运行 visual gate，并根据字幕带位置选择 `bottom-band` 或 `centered-band`。语义时间点画面价值过低时，按同句附近、同主题候选、全片稀疏候选的有界顺序自动换主图，但第一句字幕带仍取自原时间点的真实像素。可在 manifest 的单项中添加可选 `hero_candidates` 数组提供同主题主图候选。每次判断写入 `render-decisions.jsonl`，逐图结果写入 `qa-results.json`；全片 fallback 标为需要主题人工复核的 `PARTIAL_PASS`。
+
 ## 脚本字幕模式
 
 ### 3B. 建立已审核的时间点 + 台词 JSON
@@ -171,7 +173,7 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render-script VIDEO \
 - 脚本模式的字号、描边、对比度在原尺寸与手机缩略图中都可读。
 - 文件数量、尺寸、比例、JSON 和总览一致。
 
-发现问题时只调整对应变量：时间点通常移动 `0.3–1.5` 秒；原生字幕被裁时调整 `band` 边界；台词条太高时先恢复自动布局；文字过长时先拆句。连续三轮仍找不到稳定画面时，换片段或报告限制，不无限微调。
+发现问题时先由原生模式的 visual gate 自动尝试同句附近换帧、同主题换候选和布局降级；脚本模式或自动修复未覆盖的问题只调整对应变量。时间点通常移动 `0.3–1.5` 秒；原生字幕被裁时调整 `band` 边界；台词条太高时先恢复自动布局；文字过长时先拆句。连续三轮仍找不到稳定画面时，换片段或报告限制，不无限微调。
 
 ## 与其他工具或 Skill 协作
 

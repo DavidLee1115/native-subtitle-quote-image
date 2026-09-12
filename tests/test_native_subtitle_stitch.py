@@ -60,6 +60,150 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(MODULE.choose_hero_fraction(7), 0.48)
         self.assertEqual(MODULE.choose_hero_fraction(4, 0.6), 0.6)
 
+    def test_native_layout_distinguishes_bottom_center_and_low_visual(self):
+        self.assertEqual(MODULE.classify_native_layout(0.78, 0.96), "bottom-band")
+        self.assertEqual(MODULE.classify_native_layout(0.38, 0.62), "centered-band")
+        self.assertEqual(
+            MODULE.classify_native_layout(0.38, 0.62, low_visual=True),
+            "low-visual-fallback",
+        )
+
+    def test_visual_gate_rejects_dark_empty_and_accepts_rich_texture(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+        self.assertFalse(MODULE.visual_assessment(empty)["passed"])
+        self.assertTrue(MODULE.visual_assessment(rich)["passed"])
+
+    def test_visual_gate_repairs_with_same_line_nearby_frame(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+
+        def fake_frame(_video, seconds):
+            return rich if seconds == 10.8 else empty
+
+        events = []
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake_frame):
+            result = MODULE.choose_visual_hero(
+                "unused.mp4",
+                10,
+                [],
+                30,
+                [],
+                [],
+                lambda event, **details: events.append((event, details)),
+            )
+        self.assertEqual(result["phase"], "same-line-nearby")
+        self.assertEqual(result["time"], 10.8)
+        self.assertTrue(any(event == "auto_repair" for event, _ in events))
+
+    def test_source_wide_fallback_prefers_human_like_candidate(self):
+        empty = Image.new("RGB", (640, 360), "#050509")
+        texture = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+        human_like = texture.copy()
+        for y in range(80, 300):
+            for x in range(180, 460):
+                human_like.putpixel((x, y), (205, 145, 105))
+
+        def fake_frame(_video, seconds):
+            if seconds == 140:
+                return texture
+            if seconds == 150:
+                return human_like
+            return empty
+
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake_frame):
+            result = MODULE.choose_visual_hero(
+                "unused.mp4",
+                100,
+                [],
+                200,
+                [],
+                [140, 150],
+                lambda _event, **_details: None,
+            )
+        self.assertEqual(result["phase"], "source-wide-fallback")
+        self.assertEqual(result["time"], 150)
+        self.assertGreater(result["assessment"]["skin_tone_ratio"], 0.10)
+
+    def test_subject_center_ignores_edge_connected_background(self):
+        width, height = 20, 10
+        mask = [False] * (width * height)
+        for y in range(6):
+            for x in range(16, 20):
+                mask[y * width + x] = True
+        for y in range(2, 9):
+            for x in range(4, 9):
+                mask[y * width + x] = True
+        center = MODULE.largest_interior_component_center(mask, width, height)
+        self.assertAlmostEqual(center, 6 / 19)
+        source = Image.new("RGB", (1920, 648))
+        centering = MODULE.subject_aware_centering(source, (1440, 1150), center)
+        self.assertLess(centering, 0.5)
+
+    def test_centered_layout_preserves_full_subtitle_band_width(self):
+        semantic = Image.new("RGB", (640, 360), "#202020")
+        for y in range(round(360 * 0.38), round(360 * 0.62)):
+            for x in range(24):
+                semantic.putpixel((x, y), (240, 20, 20))
+                semantic.putpixel((639 - x, y), (20, 220, 20))
+        rich = Image.effect_noise((160, 90), 90).convert("RGB").resize(
+            (640, 360), Image.Resampling.NEAREST
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            MODULE, "grab_frame", return_value=semantic
+        ):
+            out = Path(tmp) / "centered.jpg"
+            report = MODULE.render_one(
+                "unused.mp4",
+                [0, 1, 2, 3, 4],
+                out,
+                (3, 4),
+                300,
+                0.38,
+                0.62,
+                None,
+                hero_frame=rich,
+                native_layout="centered-band",
+            )
+            self.assertEqual(report["subtitle_horizontal_retention"], 1.0)
+            with Image.open(out) as rendered:
+                band_y = report["hero_height"] - report["band_height"] // 2
+                self.assertGreater(rendered.getpixel((2, band_y))[0], 150)
+                self.assertGreater(rendered.getpixel((297, band_y))[1], 130)
+
+    def test_low_visual_fallback_excludes_candidate_lower_overlay(self):
+        semantic = Image.new("RGB", (640, 360), "#202020")
+        hero = Image.new("RGB", (640, 360), "#1d4ed8")
+        for y in range(216, 360):
+            for x in range(640):
+                hero.putpixel((x, y), (220, 20, 20))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            MODULE, "grab_frame", return_value=semantic
+        ):
+            out = Path(tmp) / "fallback.jpg"
+            report = MODULE.render_one(
+                "unused.mp4",
+                [0, 1, 2, 3, 4],
+                out,
+                (3, 4),
+                300,
+                0.38,
+                0.62,
+                None,
+                hero_frame=hero,
+                native_layout="low-visual-fallback",
+            )
+            with Image.open(out) as rendered:
+                visual_bottom = report["hero_height"] - report["band_height"] - 4
+                blue = rendered.getpixel((150, visual_bottom))
+                self.assertGreater(blue[2], blue[0] * 2)
+
     def test_script_lines_require_increasing_timestamps_and_text(self):
         lines = MODULE.normalize_script_lines(
             {
@@ -312,6 +456,8 @@ class CliIntegrationTests(unittest.TestCase):
                     str(out_dir),
                     "--width",
                     "300",
+                    "--visual-gate",
+                    "off",
                 ],
                 check=True,
                 capture_output=True,
@@ -321,6 +467,8 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertTrue(output.is_file())
             self.assertTrue((out_dir / "final_contact_sheet.jpg").is_file())
             self.assertTrue((out_dir / "原生字幕时间点.json").is_file())
+            self.assertTrue((out_dir / "qa-results.json").is_file())
+            self.assertTrue((out_dir / "render-decisions.jsonl").is_file())
             with Image.open(output) as rendered:
                 self.assertEqual(rendered.size, (300, 400))
 
