@@ -340,6 +340,293 @@ def _percentile(values: Sequence[int], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def _connected_components(mask: Image.Image) -> list[dict[str, int]]:
+    """Return 8-connected components for a small binary image."""
+    width, height = mask.size
+    pixels = mask.load()
+    unseen = {
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if pixels[x, y]
+    }
+    components = []
+    while unseen:
+        start = unseen.pop()
+        stack = [start]
+        min_x = max_x = start[0]
+        min_y = max_y = start[1]
+        area = 0
+        while stack:
+            x, y = stack.pop()
+            area += 1
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            for next_y in range(max(0, y - 1), min(height, y + 2)):
+                for next_x in range(max(0, x - 1), min(width, x + 2)):
+                    point = (next_x, next_y)
+                    if point in unseen:
+                        unseen.remove(point)
+                        stack.append(point)
+        components.append(
+            {
+                "left": min_x,
+                "top": min_y,
+                "right": max_x + 1,
+                "bottom": max_y + 1,
+                "width": max_x - min_x + 1,
+                "height": max_y - min_y + 1,
+                "area": area,
+            }
+        )
+    return components
+
+
+def _source_text_like_metrics(image: Image.Image) -> dict[str, Any]:
+    """Find compact, row-aligned high-contrast components in source pixels.
+
+    This intentionally differs from ``native_subtitle_presence``: it operates
+    on source-only pixels inside the generated glyph clearance box and asks
+    whether text-like source components occupy that same visual space.  It
+    does not validate native subtitles or generated text presence.
+    """
+    color = image.convert("RGB")
+    if color.width > 480:
+        scale = 480 / color.width
+        color = color.resize(
+            (480, max(1, round(color.height * scale))), Image.Resampling.LANCZOS
+        )
+    gray = color.convert("L")
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    local_background = gray.filter(ImageFilter.MedianFilter(size=9))
+    local_difference = ImageChops.difference(gray, local_background)
+    width, height = gray.size
+
+    masks = {}
+    for polarity in ("bright", "dark", "local_contrast"):
+        mask = Image.new("1", gray.size)
+        target = mask.load()
+        for y in range(height):
+            for x in range(width):
+                value = gray.getpixel((x, y))
+                edge = edges.getpixel((x, y))
+                difference = local_difference.getpixel((x, y))
+                if polarity == "bright":
+                    enabled = value >= 205 and edge >= 28 and difference >= 14
+                elif polarity == "dark":
+                    enabled = value <= 50 and edge >= 28 and difference >= 14
+                else:
+                    enabled = edge >= 42 and difference >= 34
+                target[x, y] = 255 if enabled else 0
+        masks[polarity] = mask
+
+    assessments = []
+    for polarity, mask in masks.items():
+        components = []
+        maximum_area = max(12, round(width * height * 0.035))
+        for component in _connected_components(mask):
+            component_width = component["width"]
+            component_height = component["height"]
+            aspect = component_width / max(1, component_height)
+            if (
+                2 <= component["area"] <= maximum_area
+                and 1 <= component_width <= max(8, round(width * 0.20))
+                and 2 <= component_height <= max(5, round(height * 0.72))
+                and 0.08 <= aspect <= 12.0
+            ):
+                components.append(component)
+
+        row_tolerance = max(3, round(height * 0.16))
+        rows: list[list[dict[str, int]]] = []
+        for component in sorted(
+            components,
+            key=lambda item: ((item["top"] + item["bottom"]) / 2, item["left"]),
+        ):
+            center = (component["top"] + component["bottom"]) / 2
+            matching = next(
+                (
+                    row
+                    for row in rows
+                    if abs(
+                        center
+                        - sum(
+                            (item["top"] + item["bottom"]) / 2 for item in row
+                        )
+                        / len(row)
+                    )
+                    <= row_tolerance
+                ),
+                None,
+            )
+            if matching is None:
+                rows.append([component])
+            else:
+                matching.append(component)
+        row_metrics = []
+        for row in rows:
+            span = (
+                max(item["right"] for item in row)
+                - min(item["left"] for item in row)
+            ) / max(1, width)
+            heights = sorted(item["height"] for item in row)
+            median_height = heights[len(heights) // 2]
+            row_metrics.append(
+                {
+                    "component_count": len(row),
+                    "horizontal_span": span,
+                    "median_component_height": median_height,
+                    "median_component_height_ratio": median_height / max(1, height),
+                }
+            )
+        strongest = max(
+            row_metrics,
+            key=lambda item: (item["component_count"], item["horizontal_span"]),
+            default={
+                "component_count": 0,
+                "horizontal_span": 0.0,
+                "median_component_height": 0,
+                "median_component_height_ratio": 0.0,
+            },
+        )
+        mask_values = (
+            mask.get_flattened_data()
+            if hasattr(mask, "get_flattened_data")
+            else mask.getdata()
+        )
+        active_pixels = sum(1 for value in mask_values if value)
+        assessments.append(
+            {
+                "polarity": polarity,
+                "compact_component_count": len(components),
+                "aligned_component_count": strongest["component_count"],
+                "aligned_horizontal_span": round(strongest["horizontal_span"], 4),
+                "aligned_median_component_height": strongest[
+                    "median_component_height"
+                ],
+                "aligned_median_component_height_ratio": round(
+                    strongest["median_component_height_ratio"], 4
+                ),
+                "active_pixel_ratio": round(active_pixels / max(1, width * height), 4),
+            }
+        )
+
+    def text_like(item):
+        return (
+            item["compact_component_count"] >= 4
+            and item["aligned_component_count"] >= 4
+            and item["aligned_horizontal_span"] >= 0.10
+            and item["aligned_median_component_height"] >= 4
+            and item["aligned_median_component_height_ratio"] >= 0.06
+            and 0.0025 <= item["active_pixel_ratio"] <= 0.18
+        )
+
+    detected_assessments = [item for item in assessments if text_like(item)]
+    best = max(
+        detected_assessments or assessments,
+        key=lambda item: (
+            item["aligned_component_count"],
+            item["aligned_horizontal_span"],
+            item["compact_component_count"],
+        ),
+    )
+    detected = bool(detected_assessments)
+    return {
+        "detected": detected,
+        "best_polarity": best["polarity"],
+        "compact_component_count": best["compact_component_count"],
+        "aligned_component_count": best["aligned_component_count"],
+        "aligned_horizontal_span": best["aligned_horizontal_span"],
+        "aligned_median_component_height": best[
+            "aligned_median_component_height"
+        ],
+        "aligned_median_component_height_ratio": best[
+            "aligned_median_component_height_ratio"
+        ],
+        "active_pixel_ratio": best["active_pixel_ratio"],
+        "polarity_assessments": assessments,
+        "sample_size": list(gray.size),
+    }
+
+
+def assess_script_source_text_collision(
+    source_only: Image.Image,
+    *,
+    generated_text_box: Sequence[int],
+    line_index: int | None = None,
+    region_kind: str = "strip",
+) -> dict[str, Any]:
+    """Detect source visual text occupying a generated script-text region."""
+    if len(generated_text_box) != 4:
+        raise ValueError("generated_text_box must contain four coordinates")
+    left, top, right, bottom = [int(value) for value in generated_text_box]
+    if right <= left or bottom <= top:
+        raise ValueError("generated_text_box must select a non-empty region")
+    text_height = bottom - top
+    clearance_x = max(3, round(text_height * 0.16))
+    clearance_y = max(3, round(text_height * 0.22))
+    collision_box = [
+        max(0, left - clearance_x),
+        max(0, top - clearance_y),
+        min(source_only.width, right + clearance_x),
+        min(source_only.height, bottom + clearance_y),
+    ]
+    if collision_box[2] <= collision_box[0] or collision_box[3] <= collision_box[1]:
+        raise ValueError("generated_text_box does not intersect source pixels")
+    metrics = _source_text_like_metrics(source_only.crop(collision_box))
+    collision = metrics["detected"]
+    return {
+        "passed": not collision,
+        "collision_detected": collision,
+        "reason": (
+            "source_text_overlaps_generated_script_clearance"
+            if collision
+            else None
+        ),
+        "line_index": line_index,
+        "region_kind": region_kind,
+        "generated_text_box": [left, top, right, bottom],
+        "collision_box": collision_box,
+        "metrics": metrics,
+        "method": "source_only_text_components_vs_generated_bbox_v1",
+    }
+
+
+def assess_script_collisions(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    expected_line_count: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate already measured script/source collision items."""
+    normalized = [dict(item) for item in items]
+    expected = len(normalized) if expected_line_count is None else expected_line_count
+    if expected < 1:
+        coverage_passed = False
+    else:
+        line_indexes = [item.get("line_index") for item in normalized]
+        coverage_passed = (
+            len(normalized) == expected
+            and all(isinstance(index, int) for index in line_indexes)
+            and sorted(line_indexes) == list(range(1, expected + 1))
+        )
+    return {
+        "all_pass": coverage_passed
+        and all(item.get("passed") is True for item in normalized),
+        "coverage_passed": coverage_passed,
+        "required_line_count": expected,
+        "measured_line_count": len(normalized),
+        "passed_line_count": sum(item.get("passed") is True for item in normalized),
+        "collision_line_indexes": [
+            item.get("line_index")
+            for item in normalized
+            if item.get("collision_detected") is True
+        ],
+        "items": normalized,
+        "policy": "source_visual_text_must_clear_generated_script_text",
+    }
+
+
 def detect_temporal_subtitle_band(
     active_frame: Image.Image,
     pre_cue_frame: Image.Image,

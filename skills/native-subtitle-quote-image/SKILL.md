@@ -164,6 +164,8 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render-script VIDEO \
 
 `render-script` 会对实际 3:4 hero crop 运行最终可渲染性检查。常规 `fit` 裁切出现主体保留不足、文字越界、低有效内容或大片空白时，先自动修复为保留完整源帧的 `contain` 布局并重做 QA。结果写入 `<output>.qa-results.json` 和 `<output>.render-decisions.jsonl`，包含 `final_renderability`、`subject_retention`、`active_content_ratio`、`excessive_blank_area` 和 `crop_safety`。
 
+脚本字幕还会在绘字前保留 source-only 区域，并把其中的 text-like connected components 与实际 generated text bbox 对照；只有源文字进入生成文字的 clearance 区域才判定 collision。碰撞时先逐条调整合法垂直采样位置，再尝试既有 `contain` layout/crop repair，每次都重做最终 QA。该检查只用于 source visual text 与 generated script text 的放置关系，不替代原生字幕的像素存在和时序验证。
+
 ## 逐张质检与有界返工
 
 先看缩略总览，再打开每张原尺寸 JPG。

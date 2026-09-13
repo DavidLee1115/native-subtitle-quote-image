@@ -734,6 +734,10 @@ class CliIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(scripted_qa["overall"], "PASS")
             self.assertIn("final_renderability", scripted_qa)
+            self.assertTrue(scripted_qa["source_text_collision"]["all_pass"])
+            self.assertEqual(
+                scripted_qa["source_text_collision"]["required_line_count"], 5
+            )
 
             repeated = subprocess.run(
                 [

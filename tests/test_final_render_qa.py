@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +34,15 @@ def valid_subtitle_strip(size=(300, 30)):
     for x in range(58, 242, 12):
         draw.rectangle((x, 9, x + 7, 13), fill="white")
         draw.rectangle((x + 3, 17, x + 9, 21), fill="white")
+    return image
+
+
+def source_text_row(size=(300, 80), y=26, color="white", background="#30343b"):
+    image = Image.new("RGB", size, background)
+    draw = ImageDraw.Draw(image)
+    for x in range(38, size[0] - 38, 16):
+        draw.rectangle((x, y, x + 4, y + 15), fill=color)
+        draw.rectangle((x + 4, y + 5, x + 10, y + 9), fill=color)
     return image
 
 
@@ -143,6 +152,136 @@ class FinalRenderabilityTests(unittest.TestCase):
             fit["final_renderability"]["reasons"],
         )
         self.assertTrue(contain["crop_safety"]["passed"])
+
+
+class ScriptSourceTextCollisionTests(unittest.TestCase):
+    def test_obvious_source_text_generated_strip_collision_fails(self):
+        source = source_text_row()
+        result = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[24, 18, 276, 58],
+            line_index=2,
+        )
+        self.assertFalse(result["passed"], result)
+        self.assertTrue(result["collision_detected"])
+        self.assertEqual(
+            result["reason"], "source_text_overlaps_generated_script_clearance"
+        )
+
+    def test_short_source_label_inside_generated_text_fails(self):
+        source = Image.new("RGB", (500, 90), "#30343b")
+        draw = ImageDraw.Draw(source)
+        for x in (20, 36, 52, 68):
+            draw.rectangle((x, 24, x + 5, 48), fill="white")
+            draw.rectangle((x + 5, 24, x + 11, 30), fill="white")
+            draw.rectangle((x + 5, 36, x + 10, 42), fill="white")
+        result = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[10, 20, 490, 65],
+        )
+        self.assertFalse(result["passed"], result)
+
+    def test_source_text_near_but_outside_generated_clearance_passes(self):
+        source = source_text_row(size=(300, 100), y=4)
+        result = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[24, 58, 276, 92],
+        )
+        self.assertTrue(result["passed"], result)
+
+    def test_ordinary_talking_head_texture_passes(self):
+        source = textured_image((300, 100))
+        result = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[24, 28, 276, 72],
+        )
+        self.assertTrue(result["passed"], result)
+
+    def test_document_source_with_safe_strip_placement_passes(self):
+        source = Image.new("RGB", (300, 120), "#f2efe6")
+        draw = ImageDraw.Draw(source)
+        for row_y in (8, 24, 40):
+            for x in range(32, 268, 15):
+                draw.rectangle((x, row_y, x + 8, row_y + 7), fill="#242424")
+        result = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[24, 76, 276, 110],
+        )
+        self.assertTrue(result["passed"], result)
+
+    def test_repaired_placement_clears_source_text(self):
+        source = source_text_row(size=(300, 120), y=63)
+        colliding = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[24, 54, 276, 96],
+        )
+        repaired = MODULE.assess_script_source_text_collision(
+            source,
+            generated_text_box=[24, 5, 276, 39],
+        )
+        self.assertFalse(colliding["passed"], colliding)
+        self.assertTrue(repaired["passed"], repaired)
+
+    def test_missing_collision_evidence_fails_closed(self):
+        result = MODULE.assess_script_collisions([], expected_line_count=1)
+        self.assertFalse(result["all_pass"])
+        self.assertFalse(result["coverage_passed"])
+
+    def test_real_veritasium_c19_collision_then_safe_band(self):
+        phase4b = ROOT.parent / "native-subtitle-quote-image-phase4b"
+        video = (
+            phase4b
+            / "benchmark"
+            / "phase4b"
+            / "source"
+            / "veritasium-education-rhgwIhB58PA"
+            / "rhgwIhB58PA.mp4"
+        )
+        if not video.is_file():
+            self.skipTest("Phase 4B Veritasium source video is not present")
+        renderer_path = (
+            ROOT
+            / "skills"
+            / "native-subtitle-quote-image"
+            / "scripts"
+            / "native_subtitle_stitch.py"
+        )
+        spec = importlib.util.spec_from_file_location("phase4c_renderer", renderer_path)
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        frame = renderer.grab_frame(video, 589.365)
+
+        def collision_at(center):
+            source_height = 128
+            center_y = round(frame.height * center)
+            y0 = max(
+                0,
+                min(frame.height - source_height, center_y - source_height // 2),
+            )
+            source = ImageOps.fit(
+                frame.crop((0, y0, frame.width, y0 + source_height)),
+                (1440, 144),
+                method=Image.Resampling.LANCZOS,
+            )
+            rendered = source.copy()
+            text = renderer.draw_scripted_subtitle(
+                rendered,
+                "of the learning styles approach within education",
+                72,
+                None,
+                80,
+                1325,
+            )
+            return MODULE.assess_script_source_text_collision(
+                source,
+                generated_text_box=text["text_box"],
+                line_index=3,
+            )
+
+        original = collision_at(0.82)
+        repaired = collision_at(0.46)
+        self.assertFalse(original["passed"], original)
+        self.assertTrue(repaired["passed"], repaired)
 
 
 class NativeSubtitlePresenceTests(unittest.TestCase):

@@ -210,6 +210,17 @@ def draw_scripted_subtitle(image, text, y_center, font_path, font_size, max_widt
         stroke_width=stroke,
         stroke_fill="black",
     )
+    return {
+        "text_box": [
+            max(0, x + box[0] - stroke),
+            max(0, y + box[1] - stroke),
+            min(image.width, x + box[2] + stroke),
+            min(image.height, y + box[3] + stroke),
+        ],
+        "font_size": getattr(font, "size", size),
+        "stroke_width": stroke,
+        "y_center": round(float(y_center), 4),
+    }
 
 
 def normalize_script_lines(data, duration):
@@ -1019,6 +1030,7 @@ def scripted_render_one(
     font_path,
     font_size,
     hero_layout="fit",
+    repair_source_text_collision=False,
 ):
     aw, ah = aspect
     out_height = round(out_width * ah / aw)
@@ -1067,38 +1079,134 @@ def scripted_render_one(
     else:
         raise ValueError("hero_layout must be fit or contain")
     first_strip_height = strip_heights[0]
-    draw_scripted_subtitle(
-        hero,
-        lines[0]["text"],
-        hero.height - first_strip_height // 2 - max(4, out_height // 150),
-        font_path,
-        min(base_font, max(16, round(first_strip_height * 0.62))),
-        round(out_width * 0.92),
+    collision_items = []
+    placement_attempts = []
+
+    def unique_positions(values):
+        result = []
+        for value in values:
+            value = round(float(value), 4)
+            if value not in result:
+                result.append(value)
+        return result
+
+    hero_background = hero.copy()
+    default_hero_center = (
+        hero.height - first_strip_height // 2 - max(4, out_height // 150)
+    )
+    hero_centers = [default_hero_center]
+    if repair_source_text_collision:
+        hero_centers.extend(
+            hero.height * ratio for ratio in (0.84, 0.74, 0.64, 0.54, 0.44)
+        )
+    hero_attempts = []
+    for center in unique_positions(hero_centers):
+        attempt = hero_background.copy()
+        text_report = draw_scripted_subtitle(
+            attempt,
+            lines[0]["text"],
+            center,
+            font_path,
+            min(base_font, max(16, round(first_strip_height * 0.62))),
+            round(out_width * 0.92),
+        )
+        collision = FINAL_QA.assess_script_source_text_collision(
+            hero_background,
+            generated_text_box=text_report["text_box"],
+            line_index=1,
+            region_kind="hero",
+        )
+        collision.update(
+            {
+                "source_timestamp": lines[0]["t"],
+                "placement": {"hero_text_center": center},
+                "generated_text": text_report,
+            }
+        )
+        hero_attempts.append(
+            {
+                "hero_text_center": center,
+                "passed": collision["passed"],
+                "collision_detected": collision["collision_detected"],
+            }
+        )
+        hero = attempt
+        hero_collision = collision
+        if collision["passed"] or not repair_source_text_collision:
+            break
+    collision_items.append(hero_collision)
+    placement_attempts.append(
+        {"line_index": 1, "region_kind": "hero", "attempts": hero_attempts}
     )
 
     strips = []
-    for line, strip_height in zip(lines[1:], strip_heights):
+    selected_strip_centers = []
+    for line_index, (line, strip_height) in enumerate(
+        zip(lines[1:], strip_heights), 2
+    ):
         frame = grab_frame(video, line["t"])
         source_height = max(
             1, round(frame.width * strip_height / out_width)
         )
         source_height = min(source_height, frame.height)
-        center_y = round(frame.height * band_center)
-        y0 = max(0, min(frame.height - source_height, center_y - source_height // 2))
-        band = frame.crop((0, y0, frame.width, y0 + source_height))
-        strip = ImageOps.fit(
-            band,
-            (out_width, strip_height),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
-        )
-        draw_scripted_subtitle(
-            strip,
-            line["text"],
-            strip.height // 2,
-            font_path,
-            min(base_font, max(16, round(strip.height * 0.62))),
-            round(out_width * 0.92),
+        centers = [band_center]
+        if repair_source_text_collision:
+            centers.extend((0.70, 0.58, 0.46, 0.34, 0.22, 0.90))
+        strip_attempts = []
+        for center in unique_positions(centers):
+            center_y = round(frame.height * center)
+            y0 = max(
+                0,
+                min(frame.height - source_height, center_y - source_height // 2),
+            )
+            band = frame.crop((0, y0, frame.width, y0 + source_height))
+            strip_background = ImageOps.fit(
+                band,
+                (out_width, strip_height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            strip = strip_background.copy()
+            text_report = draw_scripted_subtitle(
+                strip,
+                line["text"],
+                strip.height // 2,
+                font_path,
+                min(base_font, max(16, round(strip.height * 0.62))),
+                round(out_width * 0.92),
+            )
+            collision = FINAL_QA.assess_script_source_text_collision(
+                strip_background,
+                generated_text_box=text_report["text_box"],
+                line_index=line_index,
+                region_kind="strip",
+            )
+            collision.update(
+                {
+                    "source_timestamp": line["t"],
+                    "source_band_box": [0, y0, frame.width, y0 + source_height],
+                    "placement": {"band_center": center},
+                    "generated_text": text_report,
+                }
+            )
+            strip_attempts.append(
+                {
+                    "band_center": center,
+                    "source_band_box": collision["source_band_box"],
+                    "passed": collision["passed"],
+                    "collision_detected": collision["collision_detected"],
+                }
+            )
+            if collision["passed"] or not repair_source_text_collision:
+                break
+        selected_strip_centers.append(center)
+        collision_items.append(collision)
+        placement_attempts.append(
+            {
+                "line_index": line_index,
+                "region_kind": "strip",
+                "attempts": strip_attempts,
+            }
         )
         strips.append(strip)
 
@@ -1120,6 +1228,16 @@ def scripted_render_one(
         "strip_heights": strip_heights,
         "source_crop_box": source_crop_box,
         "hero_box": [0, 0, out_width, hero_height],
+        "source_text_collision": FINAL_QA.assess_script_collisions(
+            collision_items, expected_line_count=len(lines)
+        ),
+        "collision_repair_enabled": bool(repair_source_text_collision),
+        "collision_repair_applied": any(
+            len(item["attempts"]) > 1 for item in placement_attempts
+        ),
+        "collision_placement_attempts": placement_attempts,
+        "selected_strip_centers": selected_strip_centers,
+        "selected_hero_text_center": hero_collision["placement"]["hero_text_center"],
     }
 
 
@@ -1952,59 +2070,8 @@ def command_render_script(args):
 
     first_frame = grab_frame(video, lines[0]["t"])
     source_visual = visual_assessment(first_frame)
-    report = scripted_render_one(
-        video,
-        lines,
-        out_path,
-        args.aspect,
-        args.width,
-        args.band_center,
-        args.hero_fraction,
-        font_path,
-        args.font_size,
-        hero_layout="fit",
-    )
-    with Image.open(out_path) as opened:
-        rendered = opened.convert("RGB")
-    initial_qa = FINAL_QA.assess_final_renderability(
-        first_frame,
-        rendered,
-        source_crop_box=report["source_crop_box"],
-        hero_box=report["hero_box"],
-        source_visual=public_assessment(source_visual),
-        layout_mode="fit",
-    )
-    portrait_crop = (
-        first_frame.width / first_frame.height
-        > args.width / report["hero_height"] + 0.03
-    )
-    unknown_subject_in_crop = (
-        portrait_crop and source_visual.get("subject_center_x") is None
-    )
-    initial_passed = (
-        initial_qa["final_renderability"]["passed"]
-        and not unknown_subject_in_crop
-    )
-    emit(
-        "qa_result",
-        stage="initial",
-        layout="fit",
-        passed=initial_passed,
-        unknown_subject_in_portrait_crop=unknown_subject_in_crop,
-        final_renderability=initial_qa,
-        source_visual=public_assessment(source_visual),
-    )
-    repaired = False
-    final_qa = initial_qa
-    if not initial_passed:
-        repaired = True
-        emit(
-            "auto_repair",
-            stage="layout_crop",
-            action="contain-blur-hero",
-            reason="fit_layout_final_renderability_failed",
-        )
-        report = scripted_render_one(
+    def render_attempt(layout, repair_collision):
+        attempt_report = scripted_render_one(
             video,
             lines,
             out_path,
@@ -2014,36 +2081,119 @@ def command_render_script(args):
             args.hero_fraction,
             font_path,
             args.font_size,
-            hero_layout="contain",
+            hero_layout=layout,
+            repair_source_text_collision=repair_collision,
         )
         with Image.open(out_path) as opened:
-            rendered = opened.convert("RGB")
-        final_qa = FINAL_QA.assess_final_renderability(
+            attempt_rendered = opened.convert("RGB")
+        renderability = FINAL_QA.assess_final_renderability(
             first_frame,
-            rendered,
-            source_crop_box=report["source_crop_box"],
-            hero_box=report["hero_box"],
+            attempt_rendered,
+            source_crop_box=attempt_report["source_crop_box"],
+            hero_box=attempt_report["hero_box"],
             source_visual=public_assessment(source_visual),
-            layout_mode="contain",
+            layout_mode=layout,
         )
+        portrait_crop = (
+            layout == "fit"
+            and first_frame.width / first_frame.height
+            > args.width / attempt_report["hero_height"] + 0.03
+        )
+        unknown_subject = (
+            portrait_crop and source_visual.get("subject_center_x") is None
+        )
+        collision = attempt_report["source_text_collision"]
+        passed = (
+            renderability["final_renderability"]["passed"]
+            and not unknown_subject
+            and collision["all_pass"]
+        )
+        return attempt_report, renderability, collision, unknown_subject, passed
+
+    report, initial_qa, initial_collision, unknown_subject_in_crop, initial_passed = (
+        render_attempt("fit", False)
+    )
+    emit(
+        "qa_result",
+        stage="initial",
+        layout="fit",
+        passed=initial_passed,
+        unknown_subject_in_portrait_crop=unknown_subject_in_crop,
+        final_renderability=initial_qa,
+        source_text_collision=initial_collision,
+        source_visual=public_assessment(source_visual),
+    )
+    repaired = False
+    final_qa = initial_qa
+    final_collision = initial_collision
+    final_passed = initial_passed
+    if not initial_collision["all_pass"]:
+        repaired = True
+        emit(
+            "auto_repair",
+            stage="layout_crop",
+            action="adjust-script-text-placement",
+            reason="source_text_generated_strip_collision",
+            collision_line_indexes=initial_collision["collision_line_indexes"],
+        )
+        (
+            report,
+            final_qa,
+            final_collision,
+            unknown_subject_in_crop,
+            final_passed,
+        ) = render_attempt("fit", True)
+        emit(
+            "qa_result",
+            stage="layout_crop",
+            layout="fit",
+            action="adjust-script-text-placement",
+            passed=final_passed,
+            unknown_subject_in_portrait_crop=unknown_subject_in_crop,
+            final_renderability=final_qa,
+            source_text_collision=final_collision,
+        )
+    if not final_passed and report["layout"] != "contain":
+        repaired = True
+        emit(
+            "auto_repair",
+            stage="layout_crop",
+            action="contain-blur-hero",
+            reason="fit_layout_final_renderability_failed",
+        )
+        (
+            report,
+            final_qa,
+            final_collision,
+            unknown_subject_in_crop,
+            final_passed,
+        ) = render_attempt("contain", not final_collision["all_pass"] or repaired)
         emit(
             "qa_result",
             stage="layout_crop",
             layout="contain",
-            passed=final_qa["final_renderability"]["passed"],
+            action="contain-blur-hero",
+            passed=final_passed,
+            unknown_subject_in_portrait_crop=unknown_subject_in_crop,
             final_renderability=final_qa,
+            source_text_collision=final_collision,
         )
     qa_payload = {
-        "overall": (
-            "PASS" if final_qa["final_renderability"]["passed"] else "FAIL"
-        ),
+        "overall": "PASS" if final_passed else "FAIL",
         "mode": "script",
         "file": out_path.name,
         "layout": report["layout"],
-        "layout_repaired": repaired,
+        "layout_repaired": report["layout"] != "fit",
+        "collision_repaired": (
+            not initial_collision["all_pass"] and final_collision["all_pass"]
+        ),
+        "repair_attempted": repaired,
         "source_visual": public_assessment(source_visual),
         "initial_final_renderability": initial_qa,
         "final_renderability": final_qa,
+        "initial_source_text_collision": initial_collision,
+        "source_text_collision": final_collision,
+        "collision_placement_attempts": report["collision_placement_attempts"],
     }
     qa_path.write_text(
         json.dumps(qa_payload, ensure_ascii=False, indent=2) + "\n",
