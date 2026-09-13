@@ -1,0 +1,118 @@
+{
+  "version": "phase5a-1",
+  "score_range": [
+    0,
+    5
+  ],
+  "platforms": {
+    "douyin": {
+      "account_stages": {
+        "cold": {
+          "weights": {
+            "clarity": 0.18,
+            "hook_strength": 0.18,
+            "standalone_value": 0.16,
+            "conflict": 0.12,
+            "specificity": 0.12,
+            "audience_relevance": 0.12,
+            "evidence_support": 0.12
+          },
+          "penalties": {
+            "cliche": 0.55,
+            "exaggeration": 1.0,
+            "diversity": 0.75
+          },
+          "thresholds": {
+            "minimum_final_score": 2.5,
+            "reject_exaggeration_at": 4.0,
+            "diversity_similarity": 0.72
+          },
+          "ideal_length": {
+            "hook": [
+              6,
+              28
+            ],
+            "title": [
+              8,
+              36
+            ],
+            "copy": [
+              50,
+              600
+            ]
+          },
+          "hook_type_strength": {
+            "contradiction": 4.6,
+            "curiosity": 4.1,
+            "pain-point": 4.3,
+            "identity": 4.0,
+            "strong-claim": 4.2
+          },
+          "cliche_patterns": [
+            "看完沉默了",
+            "太真实了",
+            "建议收藏",
+            "狠狠爱了",
+            "狠狠共鸣",
+            "懂的都懂",
+            "破防了",
+            "泪目了"
+          ],
+          "exaggeration_patterns": [
+            "所有人都",
+            "人人必看",
+            "百分之百",
+            "100%",
+            "一定会",
+            "绝对",
+            "史上最",
+            "唯一",
+            "彻底改变",
+            "震惊"
+          ],
+          "standalone_context_patterns": [
+            "这件事",
+            "这句话",
+            "他们说",
+            "原来如此",
+            "接着说"
+          ],
+          "conflict_patterns": [
+            "但是",
+            "却",
+            "反而",
+            "不是",
+            "而是",
+            "越",
+            "难",
+            "问题",
+            "代价",
+            "误区",
+            "冲突"
+          ],
+          "specificity_patterns": [
+            "为什么",
+            "如何",
+            "原因",
+            "步骤",
+            "方法",
+            "先",
+            "再",
+            "分钟",
+            "天",
+            "次"
+          ],
+          "audience_patterns": [
+            "你",
+            "新手",
+            "普通人",
+            "职场人",
+            "创作者",
+            "父母",
+            "年轻人"
+          ]
+        }
+      }
+    }
+  }
+}

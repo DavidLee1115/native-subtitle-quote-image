@@ -4,6 +4,16 @@ Based on upstream native-subtitle-quote-image v2.1.1
 
 Enhanced by David Lee
 
+## Phase 5A
+
+- Douyin cold-start publishing package
+- independent publishing scoring
+- hook/title candidate ranking
+- claim-evidence provenance
+- fail-closed unsupported claims
+- inferred account positioning
+- publishing QA
+
 ## Phase 4C
 
 - source-text / generated-strip collision QA
